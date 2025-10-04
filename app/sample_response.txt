@@ -1,0 +1,2 @@
+// sample response of sarvam translate api :
+request_id='20251004_8ebc3f13-3df5-46f8-b141-9cbcf74228c7' transcript='Why does the sky look blue?' language_code='hi-IN' diarized_transcript=None

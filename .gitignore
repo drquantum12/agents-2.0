@@ -1,0 +1,11 @@
+**/env
+**/creds
+**/setup.sh
+**/__pycache__/
+**/.DS_Store
+**/docker-build-deploy.sh
+**/Dockerfile
+**/setup.sh
+**/.ipynb_checkpoints
+**/.vscode/
+**/.ipynb
