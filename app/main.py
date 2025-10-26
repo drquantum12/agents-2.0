@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi import status
 from fastapi.middleware import cors as middleware
 import tempfile
-from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput
+from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
 import base64
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
@@ -69,30 +69,36 @@ async def streaming_audio_response(
     text: str, language_code: str = "en-IN"
 ) -> AsyncGenerator[bytes, None]:
     client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
+    
+    # Open file in async-safe way (sync I/O is fine here because chunks are small)
+    try:
+        async with client.text_to_speech_streaming.connect(model="bulbul:v2", send_completion_event=True) as ws:
+            await ws.configure(target_language_code=language_code, speaker="anushka")
+            
+            # Send text and flush once
+            await ws.convert(text)
+            await ws.flush()
 
-    async with client.text_to_speech_streaming.connect(model="bulbul:v2") as ws:
-        await ws.configure(target_language_code=language_code, speaker="anushka")
-        await ws.convert(text)
-        await ws.flush()
+            # Stream chunks as they come
+            with open("output_v2.mp3", "wb") as output_file:
+                async for message in ws:
+                    if isinstance(message, AudioOutput):
+                        audio_chunk = base64.b64decode(message.data.audio)
+                        
+                        # Write to file immediately
+                        output_file.write(audio_chunk)
+                        output_file.flush()
+                        
+                        # Yield to client immediately
+                        yield audio_chunk
+                    
+                    elif isinstance(message, EventResponse):
+                        if message.data.event_type == "final":
+                            break
 
-        chunk_count = 0
-
-        async for message in ws:
-            if isinstance(message, AudioOutput):
-                audio_chunk = base64.b64decode(message.data.audio)
-                
-                # Immediately yield each chunk
-                yield audio_chunk
-                chunk_count += 1
-                logger.info(f"Yielded chunk {chunk_count} of audio data")
-
-        # Close WebSocket cleanly once done
-        if hasattr(ws, "_websocket") and not ws._websocket.closed:
-            await ws._websocket.close()
-            logger.info("WebSocket connection closed after streaming.")
-
-    # Optional: yield a few silent bytes to ensure the client finishes playback
-    yield b"\x00" * 200
+    except Exception as e:
+        logger.error(f"Error during audio streaming and saving: {e}")
+        raise
 
 # async def streaming_audio_response(text: str, language_code: str = "en-IN") -> AsyncGenerator[bytes, None]:
 #     with open("output_v2.mp3", "wb") as output_file:
@@ -124,7 +130,7 @@ async def streaming_audio_response(
 
 @app.get("/test-audio-generator")
 async def test_audio_generator():
-    sample_text = "Hello i am stephen hawking. I am testing the audio streaming functionality of this API."
+    sample_text = "Hello i am Arjun Tomar. I am testing the audio streaming functionality of this API."
     return StreamingResponse(
         streaming_audio_response(sample_text),
         media_type="audio/mpeg"
