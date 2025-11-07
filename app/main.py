@@ -80,22 +80,34 @@ async def streaming_audio_response(
             await ws.flush()
 
             # Stream chunks as they come
-            with open("output.mp3", "wb") as output_file:
-                async for message in ws:
-                    if isinstance(message, AudioOutput):
-                        audio_chunk = base64.b64decode(message.data.audio)
+            # with open("output.mp3", "wb") as output_file:
+            #     async for message in ws:
+            #         if isinstance(message, AudioOutput):
+            #             audio_chunk = base64.b64decode(message.data.audio)
                         
-                        # Write to file immediately
-                        output_file.write(audio_chunk)
-                        output_file.flush()
+            #             # Write to file immediately
+            #             output_file.write(audio_chunk)
+            #             output_file.flush()
                         
-                        # Yield to client immediately
-                        yield audio_chunk
-                        await asyncio.sleep(0.5)
+            #             # Yield to client immediately
+            #             yield audio_chunk
+            #             await asyncio.sleep(0.5)
                     
-                    elif isinstance(message, EventResponse):
-                        if message.data.event_type == "final":
-                            break
+            #         elif isinstance(message, EventResponse):
+            #             if message.data.event_type == "final":
+            #                 break
+
+            async for message in ws:
+                if isinstance(message, AudioOutput):
+                    audio_chunk = base64.b64decode(message.data.audio)
+                    
+                    # Yield to client immediately
+                    yield audio_chunk
+                    await asyncio.sleep(0.5)
+                
+                elif isinstance(message, EventResponse):
+                    if message.data.event_type == "final":
+                        break
 
     except Exception as e:
         logger.error(f"Error during audio streaming and saving: {e}")
@@ -191,8 +203,8 @@ async def handle_audio_upload(request: Request):
         wav_data = await request.body()
         
         # Debugging: saving wav data as audio_input.wav
-        with open("audio_input_v2.wav", "wb") as f:
-            f.write(wav_data)
+        # with open("audio_input_v2.wav", "wb") as f:
+        #     f.write(wav_data)
 
         print(f"Sending audio stream...\n")
 
