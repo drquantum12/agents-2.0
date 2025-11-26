@@ -9,8 +9,8 @@ from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
 import base64
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
-from prompts import AI_TUTOR_PROMPT 
-from db_utility.vector_db import VectorDB 
+from prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
+# from db_utility.vector_db import VectorDB 
 import logging, uvicorn
 from typing import AsyncGenerator, Callable
 
@@ -26,14 +26,14 @@ llm = ChatGoogleGenerativeAI(
             max_retries=2,)
 
 # Initialize with placeholder instances since actual imports are missing
-try:
-    vector_db = VectorDB()
-except NameError:
-    class DummyVectorDB:
-        def get_similar_documents(self, query, top_k):
-            return "Sample context for the query.", ["doc1"]
-    vector_db = DummyVectorDB()
-    logger.warning("Using DummyVectorDB as VectorDB class definition was not found.")
+# try:
+#     vector_db = VectorDB()
+# except NameError:
+#     class DummyVectorDB:
+#         def get_similar_documents(self, query, top_k):
+#             return "Sample context for the query.", ["doc1"]
+#     vector_db = DummyVectorDB()
+#     logger.warning("Using DummyVectorDB as VectorDB class definition was not found.")
 
 try:
     # Assuming AI_TUTOR_PROMPT is a class/object with an invoke method
@@ -221,10 +221,10 @@ async def handle_audio_upload(request: Request):
         logger.info(f"Received request from ESP32. Content-Type: {content_type}")
 
         # Note: vector_db usage assumes the class is defined/imported correctly
-        context, _ = vector_db.get_similar_documents(result.transcript, top_k=3)
-        logger.info(f"Context retrieved: {context}")
+        # context, _ = vector_db.get_similar_documents(result.transcript, top_k=3)
+        # logger.info(f"Context retrieved: {context}")
 
-        prompt = AI_TUTOR_PROMPT.invoke({"query": result.transcript, "context": context})
+        prompt = AI_DEVICE_TUTOR_PROMPT.invoke({"query": result.transcript})
         response = llm.invoke(prompt).content.strip()
 
         logger.info(f"LLM response obtained: {response}")
@@ -250,6 +250,8 @@ async def handle_audio_upload(request: Request):
         #     headers=headers
         # )
 
+        # return JSONResponse(content="Successfully saved!", status_code=status.HTTP_200_OK)
+
     except Exception as e:
         logger.error(f"Error during audio processing: {e}")
         return JSONResponse(
@@ -271,10 +273,11 @@ async def voice_assistant(file: UploadFile = File(...)):
         
         logger.info(f"Translation: {result.transcript}")
 
-        context, _ = vector_db.get_similar_documents(result.transcript, top_k=3)
-        logger.info(f"Context retrieved: {context}")
+        # context, _ = vector_db.get_similar_documents(result.transcript, top_k=3)
+        # logger.info(f"Context retrieved: {context}")
 
-        prompt = AI_TUTOR_PROMPT.invoke({"query": result.transcript, "context": context})
+        # prompt = AI_TUTOR_PROMPT.invoke({"query": result.transcript, "context": context})
+        prompt = AI_TUTOR_PROMPT.invoke({"query": result.transcript})
         response = llm.invoke(prompt).content.strip()
 
         logger.info(f"LLM response obtained: {response}")
@@ -307,5 +310,3 @@ async def test_tts_stream():
         media_type="audio/mpeg"
     )
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
