@@ -11,6 +11,7 @@ MILVUS_TOKEN = os.getenv('MILVUS_TOKEN')
 COLLECTION_NAME = os.getenv('MILVUS_COLLECTION_NAME')
 VECTOR_DIMENSION = int(os.getenv('MILVUS_VECTOR_DIMENSION', 768))
 
+# metadata_fields = ["board", "grade", "subject", "chapter", "heading", "subheading", "content"]
 
 class VectorDB:
     

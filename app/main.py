@@ -9,7 +9,7 @@ from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
 import base64
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
-from prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
+from app.prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
 # from db_utility.vector_db import VectorDB 
 import logging, uvicorn
 from typing import AsyncGenerator, Callable
@@ -35,20 +35,6 @@ llm = ChatGoogleGenerativeAI(
 #     vector_db = DummyVectorDB()
 #     logger.warning("Using DummyVectorDB as VectorDB class definition was not found.")
 
-try:
-    # Assuming AI_TUTOR_PROMPT is a class/object with an invoke method
-    from prompts import AI_TUTOR_PROMPT 
-except ImportError:
-    class DummyPrompt:
-        def invoke(self, kwargs):
-            return f"The user asked: {kwargs['query']}. Context: {kwargs['context']}"
-    # Creating a dummy object to match the usage in the endpoints
-    class DummyPromptInvoker:
-        def invoke(self, kwargs):
-            return DummyPrompt().invoke(kwargs)
-    AI_TUTOR_PROMPT = DummyPromptInvoker()
-    logger.warning("Using DummyPrompt for AI_TUTOR_PROMPT as definition was not found.")
-
 app = FastAPI()
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
@@ -61,6 +47,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from app.routers import auth, user
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(user.router, prefix="/api/v1")
 
 client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 
@@ -80,7 +70,7 @@ async def streaming_audio_response(
             await ws.flush()
 
             # Stream chunks as they come
-            # with open("output.mp3", "wb") as output_file:
+            # with open("data/output.mp3", "wb") as output_file:
             #     async for message in ws:
             #         if isinstance(message, AudioOutput):
             #             audio_chunk = base64.b64decode(message.data.audio)
@@ -114,7 +104,7 @@ async def streaming_audio_response(
         raise
 
 # async def streaming_audio_response(text: str, language_code: str = "en-IN") -> AsyncGenerator[bytes, None]:
-#     with open("output_v2.mp3", "wb") as output_file:
+#     with open("data/output_v2.mp3", "wb") as output_file:
 #         try:
 #             # Initialize Async Client inside the async function
 #             client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
@@ -156,7 +146,7 @@ Photosynthesis is how plants make their own food! It's like a plant's personal c
 async def test_audio_stream():
     # Helper for testing the stream from file
     try:
-        with open("output_v2.mp3", "rb") as audio_file:
+        with open("data/output_v2.mp3", "rb") as audio_file:
             while chunk := audio_file.read(100000):  # 100KB chunks
                 yield chunk
                 await asyncio.sleep(0)
@@ -203,7 +193,7 @@ async def handle_audio_upload(request: Request):
         wav_data = await request.body()
         
         # Debugging: saving wav data as audio_input.wav
-        # with open("audio_input_v2.wav", "wb") as f:
+        # with open("data/audio_input_v2.wav", "wb") as f:
         #     f.write(wav_data)
 
         print(f"Sending audio stream...\n")
