@@ -1,6 +1,7 @@
 annotated-types==0.7.0
 anyio==4.11.0
 backports-datetime-fromisoformat==2.0.3
+bcrypt==4.0.1
 CacheControl==0.14.4
 cachetools==6.2.1
 certifi==2025.10.5
@@ -43,6 +44,10 @@ jsonpointer==3.0.0
 langchain-core==1.0.0
 langchain-google-genai==3.0.0
 langchain-ollama==1.0.0
+langgraph==1.0.4
+langgraph-checkpoint==3.0.1
+langgraph-prebuilt==1.0.5
+langgraph-sdk==0.2.10
 langsmith==0.4.37
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
@@ -53,8 +58,10 @@ msgpack==1.1.2
 numpy==2.3.4
 ollama==0.6.0
 orjson==3.11.3
+ormsgpack==1.12.0
 packaging==25.0
 pandas==2.3.3
+passlib==1.7.4
 proto-plus==1.26.1
 protobuf==6.33.0
 pyasn1==0.6.1
@@ -96,6 +103,5 @@ uvicorn==0.38.0
 uvloop==0.22.1
 watchfiles==1.1.1
 websockets==15.0.1
+xxhash==3.6.0
 zstandard==0.25.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1

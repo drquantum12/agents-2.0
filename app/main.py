@@ -9,7 +9,7 @@ from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
 import base64
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
-from app.prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
+from app.agents.prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
 # from db_utility.vector_db import VectorDB 
 import logging, uvicorn
 from typing import AsyncGenerator, Callable
@@ -48,9 +48,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.routers import auth, user
+from app.routers import auth, user, conversation, message, agent, device
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(user.router, prefix="/api/v1")
+app.include_router(conversation.router, prefix="/api/v1")
+app.include_router(message.router, prefix="/api/v1")
+app.include_router(agent.router, prefix="/api/v1")
+app.include_router(device.router, prefix="/api/v1")
 
 client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 
