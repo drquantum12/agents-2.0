@@ -27,6 +27,11 @@ async def agent(request: QueryRequest, user: User = Depends(get_current_user)):
 @router.post("/device-voice-assistant")
 async def device_voice_assistant(request: Request, user: User = Depends(get_current_user)):
     wav_data = await request.body()
+
+    # with open("app/data/input_24bit.wav", "wb") as f:
+    #         f.write(wav_data)
+    
+    # return {"detail": "Voice assistant endpoint is under maintenance."}
     
     with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as temp_audio:
             temp_audio.write(wav_data)

@@ -16,6 +16,7 @@ class AgentState(TypedDict, total=False):
     user: dict
     query: str
     history: list[BaseMessage]
+    response: str
 
 
 def dialog_manager_agent(state: AgentState, config: RunnableConfig):
@@ -27,6 +28,7 @@ def dialog_manager_agent(state: AgentState, config: RunnableConfig):
         "chat_history": state["history"]
     })
     resp = llm.invoke(prompt).content.strip()
+    state["response"] = resp
     return state
 
 def build_agent():
@@ -42,20 +44,20 @@ def build_agent():
 
 def run_agent(user: dict, query: str, session_id: str):
     try:
-        resp = ""
         chat_history = get_chat_history(session_id)
         state = AgentState(
             user=user,
             query=query,
-            history=chat_history.messages
+            history=chat_history.messages,
+            response=""
         )
 
         config = {"configurable": {"session_id": session_id}}
 
         agent = build_agent()
         
-        for chunk, metadata in agent.stream(state, config=config, stream_mode="messages"):
-            resp += chunk.content
+        result_state = agent.invoke(state, config=config)
+        resp = result_state["response"]
         
         chat_history.add_user_message(query)
         chat_history.add_ai_message(resp)

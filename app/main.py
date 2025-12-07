@@ -197,46 +197,46 @@ async def handle_audio_upload(request: Request):
         wav_data = await request.body()
         
         # Debugging: saving wav data as audio_input.wav
-        # with open("data/audio_input_v2.wav", "wb") as f:
-        #     f.write(wav_data)
+        with open("app/data/input_24bit.wav", "wb") as f:
+            f.write(wav_data)
 
-        print(f"Sending audio stream...\n")
+        # print(f"Sending audio stream...\n")
 
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as temp_audio:
-            temp_audio.write(wav_data)
-            temp_audio.flush()
-            result = client.speech_to_text.translate(
-            file=temp_audio,
-            model="saaras:v2.5"
-        )
-        logger.info(f"Translation: {result.transcript}")
+        # with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as temp_audio:
+        #     temp_audio.write(wav_data)
+        #     temp_audio.flush()
+        #     result = client.speech_to_text.translate(
+        #     file=temp_audio,
+        #     model="saaras:v2.5"
+        # )
+        # logger.info(f"Translation: {result.transcript}")
         
-        content_type = request.headers.get("content-type")
-        logger.info(f"Received request from ESP32. Content-Type: {content_type}")
+        # content_type = request.headers.get("content-type")
+        # logger.info(f"Received request from ESP32. Content-Type: {content_type}")
 
-        # Note: vector_db usage assumes the class is defined/imported correctly
-        # context, _ = vector_db.get_similar_documents(result.transcript, top_k=3)
-        # logger.info(f"Context retrieved: {context}")
+        # # Note: vector_db usage assumes the class is defined/imported correctly
+        # # context, _ = vector_db.get_similar_documents(result.transcript, top_k=3)
+        # # logger.info(f"Context retrieved: {context}")
 
-        prompt = AI_DEVICE_TUTOR_PROMPT.invoke({"query": result.transcript})
-        response = llm.invoke(prompt).content.strip()
+        # prompt = AI_DEVICE_TUTOR_PROMPT.invoke({"query": result.transcript})
+        # response = llm.invoke(prompt).content.strip()
 
-        logger.info(f"LLM response obtained: {response}")
+        # logger.info(f"LLM response obtained: {response}")
 
-        if result.language_code != "en-IN":
-            response = translate_text(response, source_language_code="en-IN", target_language_code=result.language_code)
+        # if result.language_code != "en-IN":
+        #     response = translate_text(response, source_language_code="en-IN", target_language_code=result.language_code)
 
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+        # headers = {
+        #     "Cache-Control": "no-cache",
+        #     "Connection": "keep-alive",
+        #     "X-Accel-Buffering": "no"
+        # }
         
-        return StreamingResponse(
-            streaming_audio_response(response, language_code=result.language_code),
-            media_type="audio/mpeg",
-            headers=headers
-        )
+        # return StreamingResponse(
+        #     streaming_audio_response(response, language_code=result.language_code),
+        #     media_type="audio/mpeg",
+        #     headers=headers
+        # )
 
         # return StreamingResponse(
         #     test_audio_stream(),
@@ -244,7 +244,7 @@ async def handle_audio_upload(request: Request):
         #     headers=headers
         # )
 
-        # return JSONResponse(content="Successfully saved!", status_code=status.HTTP_200_OK)
+        return JSONResponse(content="Successfully saved!", status_code=status.HTTP_200_OK)
 
     except Exception as e:
         logger.error(f"Error during audio processing: {e}")

@@ -14,7 +14,7 @@ def get_chat_history(session_id: str):
         connection_string=os.getenv("MONGODB_CONNECTION_STRING"),
         database_name="neurosattva",
         collection_name="sessions",
-        max_recent_messages=10
+        max_recent_messages=2
     )
 
 def get_or_create_device_session_id(user_id: str):
