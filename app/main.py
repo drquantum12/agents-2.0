@@ -1,4 +1,4 @@
-import os
+import os, wave
 import asyncio
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -16,6 +16,10 @@ from typing import AsyncGenerator, Callable
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+BIT_DEPTH = 32
 
 # --- Initialization (Assuming classes like VectorDB, AI_TUTOR_PROMPT are defined elsewhere) ---
 llm = ChatGoogleGenerativeAI(
@@ -64,6 +68,11 @@ async def streaming_audio_response(
 ) -> AsyncGenerator[bytes, None]:
     client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
     
+    # Ensure output directory exists
+    output_dir = os.path.join(os.path.dirname(__file__), "data")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "output.mp3")
+    
     # Open file in async-safe way (sync I/O is fine here because chunks are small)
     try:
         async with client.text_to_speech_streaming.connect(model="bulbul:v2", send_completion_event=True) as ws:
@@ -74,34 +83,34 @@ async def streaming_audio_response(
             await ws.flush()
 
             # Stream chunks as they come
-            # with open("data/output.mp3", "wb") as output_file:
-            #     async for message in ws:
-            #         if isinstance(message, AudioOutput):
-            #             audio_chunk = base64.b64decode(message.data.audio)
+            with open(output_path, "wb") as output_file:
+                async for message in ws:
+                    if isinstance(message, AudioOutput):
+                        audio_chunk = base64.b64decode(message.data.audio)
                         
-            #             # Write to file immediately
-            #             output_file.write(audio_chunk)
-            #             output_file.flush()
+                        # Write to file immediately
+                        output_file.write(audio_chunk)
+                        output_file.flush()
                         
-            #             # Yield to client immediately
-            #             yield audio_chunk
-            #             await asyncio.sleep(0.5)
+                        # Yield to client immediately
+                        yield audio_chunk
+                        await asyncio.sleep(0.5)
                     
-            #         elif isinstance(message, EventResponse):
-            #             if message.data.event_type == "final":
-            #                 break
+                    elif isinstance(message, EventResponse):
+                        if message.data.event_type == "final":
+                            break
 
-            async for message in ws:
-                if isinstance(message, AudioOutput):
-                    audio_chunk = base64.b64decode(message.data.audio)
+            # async for message in ws:
+            #     if isinstance(message, AudioOutput):
+            #         audio_chunk = base64.b64decode(message.data.audio)
                     
-                    # Yield to client immediately
-                    yield audio_chunk
-                    await asyncio.sleep(0.5)
+            #         # Yield to client immediately
+            #         yield audio_chunk
+            #         await asyncio.sleep(0.5)
                 
-                elif isinstance(message, EventResponse):
-                    if message.data.event_type == "final":
-                        break
+            #     elif isinstance(message, EventResponse):
+            #         if message.data.event_type == "final":
+            #             break
 
     except Exception as e:
         logger.error(f"Error during audio streaming and saving: {e}")
@@ -138,9 +147,7 @@ async def streaming_audio_response(
 @app.get("/test-audio-generator")
 async def test_audio_generator():
     sample_text = """
-Okay, here's a breakdown of photosynthesis in about 100 words, using the information you provided:
-
-Photosynthesis is how plants make their own food! It's like a plant's personal cooking process. Plants use a green substance called chlorophyll to absorb sunlight. They then take in carbon dioxide from the air and water from the ground. Inside the plant, these ingredients are combined to create sugars, which the plant uses as food for energy and growth. A bonus byproduct of this amazing process is oxygen, which is released into the air. So, plants not only feed themselves, but they also give us the air we breathe!
+Robotic intelligence is the integration of Artificial Intelligence (AI) into physical robots, enabling them to perceive, reason, learn, and act autonomously rather than just following pre-programmed instructions. By combining AI "brains" with robotic "bodies," these systems process sensor data to navigate, solve problems, and interact with humans and environments.
 """
     return StreamingResponse(
         streaming_audio_response(sample_text),
@@ -150,7 +157,7 @@ Photosynthesis is how plants make their own food! It's like a plant's personal c
 async def test_audio_stream():
     # Helper for testing the stream from file
     try:
-        with open("data/output_v2.mp3", "rb") as audio_file:
+        with open("app/data/sample.mp3", "rb") as audio_file:
             while chunk := audio_file.read(100000):  # 100KB chunks
                 yield chunk
                 await asyncio.sleep(0)
@@ -196,8 +203,15 @@ async def handle_audio_upload(request: Request):
     try:
         wav_data = await request.body()
         
+        
         # Debugging: saving wav data as audio_input.wav
-        with open("app/data/input_24bit.wav", "wb") as f:
+        # with wave.open("app/data/input_32bit.wav", "wb") as wf:
+        #     wf.setnchannels(CHANNELS)
+        #     wf.setsampwidth(BIT_DEPTH//8)
+        #     wf.setframerate(SAMPLE_RATE)
+        #     wf.writeframes(wav_data)
+
+        with open("app/data/input_32bit.wav", "wb") as f:
             f.write(wav_data)
 
         # print(f"Sending audio stream...\n")
