@@ -12,10 +12,13 @@ from app.agents.prompts import (
     TUTOR_EXPLANATION_PROMPT, 
     EVALUATOR_PROMPT,
     REFLECTION_PROMPT,
-    TOPIC_ANALYSIS_PROMPT
+    TOPIC_ANALYSIS_PROMPT,
+    SMALL_TALK_PROMPT
 )
 import logging
 import operator
+import re
+import random
 from app.agents.schemas import LessonPlanSchema, EvaluationSchema, TopicAnalysisSchema
 import json
 
@@ -28,6 +31,70 @@ llm_with_eval_tool = llm.bind_tools(tools=[EvaluationSchema])
 llm_with_topic_analysis_tool = llm.bind_tools(tools=[TopicAnalysisSchema])
 
 MAX_STEPS = 5
+
+# ========================================
+# SMALL TALK FAST PATH (Zero-overhead detection)
+# ========================================
+
+SMALL_TALK_PATTERNS = [
+    r'^(hi|hello|hey|howdy|sup|yo)\b',
+    r'^(good\s+)?(morning|afternoon|evening|night)',
+    r"how\s+are\s+you",
+    r"how'?s?\s+it\s+going",
+    r"what'?s?\s+up",
+    r"tell\s+me\s+a\s+joke",
+    r'^(bye|goodbye|see\s+you|later|take\s+care)',
+    r'^(thanks|thank\s+you)',
+    r"^i'?m\s+(bored|tired|happy|sad|excited|good|fine|great|ok(?:ay)?)",
+    r'^(haha|lol|lmao)',
+    r'^who\s+are\s+you',
+    r"^what('?s|\s+is)\s+your\s+name",
+    r'^(nice|cool|awesome|great|wow)$',
+    r"^you'?re?\s+(funny|cool|nice|great|awesome)",
+]
+
+# Patterns for detecting repeat/replay requests - fast path before LLM call
+REPEAT_REQUEST_PATTERNS = [
+    r"(couldn'?t|can'?t|could\s+not|did\s+not|didn'?t)\s+(hear|understand|catch|get)",
+    r"(repeat|say\s+(that|it|this)\s+again)",
+    r"(come\s+again|pardon|once\s+more|one\s+more\s+time)",
+    r"what\s+(did|was)\s+you\s+(say|ask)",
+    r"(say|tell|ask)\s+(that|it|me)\s+again",
+    r"(again\s+please|please\s+again|please\s+repeat)",
+    r"^again$",
+    r"(can|could)\s+you\s+(repeat|say\s+(that|it)\s+again)",
+    r"i\s+missed\s+(that|it|what\s+you\s+said)",
+    r"what\s+(question|did\s+you\s+ask)",
+    r"(speak|talk)\s+(louder|up)",
+]
+
+
+def is_small_talk(query: str) -> bool:
+    """Fast rule-based detection of small talk queries. Zero LLM cost."""
+    query_lower = query.strip().lower()
+    # Small talk is typically short
+    if len(query_lower.split()) <= 10:
+        for pattern in SMALL_TALK_PATTERNS:
+            if re.search(pattern, query_lower):
+                return True
+    return False
+
+
+def is_repeat_request(query: str) -> bool:
+    """Fast rule-based detection of repeat/replay requests. Zero LLM cost."""
+    query_lower = query.strip().lower()
+    if len(query_lower.split()) <= 15:
+        for pattern in REPEAT_REQUEST_PATTERNS:
+            if re.search(pattern, query_lower):
+                return True
+    return False
+
+
+def handle_small_talk(query: str) -> str:
+    """Handle casual conversation with a single fast LLM call. Bypasses entire graph."""
+    prompt = SMALL_TALK_PROMPT.format(query=query)
+    response = llm.invoke(prompt)
+    return response.content
 
 class AgentState(TypedDict):
     """The state of the guided learning agent."""
@@ -299,6 +366,27 @@ def analyze_topic_context(state: AgentState) -> dict:
     latest_user_query = user_messages[-1].content
     last_agent_message = ai_messages[-1].content if ai_messages else ""
     
+    # FAST PATH: Detect repeat requests without LLM call
+    if is_repeat_request(latest_user_query):
+        logger.info("Repeat request detected (fast path), replaying last AI message")
+        if last_agent_message:
+            repeat_prefixes = [
+                "Sure, let me repeat that. ",
+                "No problem, here it is again. ",
+                "Of course, I will say it again. ",
+                "Absolutely, let me repeat. ",
+                "No worries, here you go. ",
+            ]
+            prefix = random.choice(repeat_prefixes)
+            repeated_msg = AIMessage(content=prefix + last_agent_message)
+        else:
+            repeated_msg = AIMessage(content="I am sorry, I do not have anything to repeat yet. Let us continue with our lesson!")
+        
+        return {
+            "messages": [repeated_msg],
+            "last_action": "repeated"
+        }
+    
     # Get current step content
     step_content = ""
     if lesson_plan and lesson_step <= len(lesson_plan):
@@ -348,11 +436,22 @@ def analyze_topic_context(state: AgentState) -> dict:
                 }
             
             elif suggested_action == 'answer_and_continue':
-                # User has a related question, answer it briefly then continue
+                # User has a related question, answer it briefly then re-ask the question
                 logger.info("User has a related question, will answer and continue")
                 
-                # Generate a brief answer
-                answer_prompt = f"Briefly answer this question about {topic}: {latest_user_query}\nKeep it to 2-3 sentences, then remind them we'll continue with step {lesson_step}."
+                # Generate a brief answer and re-ask the pending question
+                answer_prompt = f"""The student asked a clarification question during a lesson on '{topic}'.
+Answer their question briefly (1-2 sentences), then naturally re-ask the question you had previously asked.
+
+Student's clarification: {latest_user_query}
+Your previous message (which contained a question): {last_agent_message[:300]}
+
+Guidelines:
+- Answer the clarification briefly
+- Then naturally transition back to the question you asked before, e.g. "So coming back to my question..."
+- Keep total response under 60 words
+- No special symbols
+- Do NOT re-explain the whole concept, just answer their question and re-ask yours"""
                 answer_response = llm.invoke(answer_prompt)
                 
                 answer_msg = AIMessage(content=answer_response.content)
@@ -373,6 +472,40 @@ def analyze_topic_context(state: AgentState) -> dict:
                 return {
                     "messages": [redirect_msg],
                     "last_action": "redirected"
+                }
+            
+            elif suggested_action == 'handle_small_talk':
+                # Small talk / casual conversation during an active lesson
+                logger.info("Small talk detected during lesson, responding naturally")
+                
+                small_talk_response = handle_small_talk(latest_user_query)
+                reminder = f" Anyway, we are on step {lesson_step} of {len(lesson_plan)} in our {topic} lesson. Ready to continue whenever you are!"
+                
+                return {
+                    "messages": [AIMessage(content=small_talk_response + reminder)],
+                    "last_action": "small_talk_responded"
+                }
+            
+            elif suggested_action == 'repeat_last_message':
+                # User wants to hear the last message again
+                logger.info("Repeat request detected, replaying last AI message")
+                
+                if last_agent_message:
+                    repeat_prefixes = [
+                        "Sure, let me repeat that. ",
+                        "No problem, here it is again. ",
+                        "Of course, I will say it again. ",
+                        "Absolutely, let me repeat. ",
+                        "No worries, here you go. ",
+                    ]
+                    prefix = random.choice(repeat_prefixes)
+                    repeated_msg = AIMessage(content=prefix + last_agent_message)
+                else:
+                    repeated_msg = AIMessage(content="I'm sorry, I don't have anything to repeat yet. Let's continue with our lesson!")
+                
+                return {
+                    "messages": [repeated_msg],
+                    "last_action": "repeated"
                 }
             
             else:  # continue_lesson
@@ -452,7 +585,7 @@ def reflect_on_knowledge_gaps(state: AgentState) -> dict:
         }
 
 
-def should_continue(state: AgentState) -> Literal["generate_explanation", "evaluate_response", "reflect", "end"]:
+def should_continue(state: AgentState) -> Literal["generate_explanation", "evaluate_response", "reflect", "analyze_topic", "plan_lesson", "end"]:
     """
     Conditional routing function.
     Decides which node to call next based on the current state.
@@ -490,12 +623,20 @@ def should_continue(state: AgentState) -> Literal["generate_explanation", "evalu
         else:
             return "generate_explanation"
     
-    # If we answered a question, continue with current step
+    # If we answered a clarification question, wait for user's next response (don't re-explain)
     if last_action == 'answered_question':
-        return "generate_explanation"
+        return "end"
+    
+    # If we repeated the last message, wait for user response
+    if last_action == 'repeated':
+        return "end"
     
     # If we redirected user, end turn and wait for response
     if last_action == 'redirected':
+        return "end"
+    
+    # If we responded to small talk, end turn and wait for next input
+    if last_action == 'small_talk_responded':
         return "end"
     
     # If context was analyzed, proceed to evaluation
@@ -618,6 +759,22 @@ def build_agent():
     return app
 
 
+# ========================================
+# CACHED AGENT SINGLETON
+# ========================================
+
+_cached_agent = None
+
+
+def get_agent():
+    """Return a cached agent instance. The graph is built once and reused across all requests."""
+    global _cached_agent
+    if _cached_agent is None:
+        _cached_agent = build_agent()
+        logger.info("Agent graph built and cached")
+    return _cached_agent
+
+
 def run_agent(user: dict, query: str, session_id: str):
     """
     Run the guided learning agent with proper state persistence.
@@ -632,13 +789,20 @@ def run_agent(user: dict, query: str, session_id: str):
             }
         }
         
-        # Build agent
-        agent = build_agent()
+        # Use cached agent (built once, reused across requests)
+        agent = get_agent()
         
         # Check if we have an existing session
         current_state = agent.get_state(config)
+        has_active_lesson = bool(current_state.values and current_state.values.get("topic"))
         
-        if current_state.values and current_state.values.get("topic"):
+        # FAST PATH: If no active lesson and query is small talk, bypass graph entirely
+        # This gives ~1 LLM call instead of 2-3, dramatically reducing time-to-first-audio
+        if not has_active_lesson and is_small_talk(query):
+            logger.info("Small talk detected with no active lesson - fast path (1 LLM call)")
+            return handle_small_talk(query)
+        
+        if has_active_lesson:
             logger.info(f"Resuming existing session for topic: {current_state.values.get('topic')}")
             # Existing session: ONLY pass the new info (messages, query)
             # Do NOT pass defaults like topic="" because that overwrites the saved state!

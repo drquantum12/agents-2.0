@@ -20,7 +20,7 @@ class QueryRequest(BaseModel):
 @router.post("/query")
 async def agent(request: QueryRequest, user: User = Depends(get_current_user)):
     session_id = get_or_create_device_session_id(user_id=user["_id"])
-    response = run_agent(user=user, query=request.query, session_id=session_id)
+    response = await asyncio.to_thread(run_agent, user=user, query=request.query, session_id=session_id)
     return {"response": response}
 
 async def test_audio_stream():
@@ -58,7 +58,7 @@ async def device_voice_assistant(request: Request,
     
     session_id = get_or_create_device_session_id(user_id=user["_id"])
     
-    response = run_agent(user=user, query=result.transcript, session_id=session_id)
+    response = await asyncio.to_thread(run_agent, user=user, query=result.transcript, session_id=session_id)
 
     if result.language_code != "en-IN":
         response = translate_text(response, source_language_code="en-IN", target_language_code=result.language_code)
