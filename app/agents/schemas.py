@@ -36,9 +36,9 @@ class TopicAnalysisSchema(BaseModel):
         ...,
         description="True if the user's query is related to the current lesson topic, False if it's a completely different topic"
     )
-    intent: Literal['answer', 'clarification', 'new_topic', 'off_topic_question', 'small_talk', 'repeat_request'] = Field(
+    intent: Literal['answer', 'clarification', 'new_topic', 'off_topic_question', 'small_talk'] = Field(
         ...,
-        description="User's intent: 'answer' (answering lesson question), 'clarification' (asking about current topic), 'new_topic' (wants to learn something new), 'off_topic_question' (unrelated question), 'small_talk' (casual conversation, greetings, jokes), 'repeat_request' (user wants you to repeat what you said)"
+        description="User's intent: 'answer' (answering lesson question), 'clarification' (asking about current topic), 'new_topic' (wants to learn something new), 'off_topic_question' (unrelated question), 'small_talk' (casual conversation, greetings, jokes)"
     )
     confidence: float = Field(
         default=0.8,
@@ -46,7 +46,7 @@ class TopicAnalysisSchema(BaseModel):
         le=1.0,
         description="Confidence level in the analysis (0.0 to 1.0)"
     )
-    suggested_action: Literal['continue_lesson', 'answer_and_continue', 'switch_topic', 'politely_redirect', 'handle_small_talk', 'repeat_last_message'] = Field(
+    suggested_action: Literal['continue_lesson', 'answer_and_continue', 'switch_topic', 'politely_redirect', 'handle_small_talk'] = Field(
         ...,
-        description="Suggested action: 'continue_lesson' (proceed with current lesson), 'answer_and_continue' (answer question then continue), 'switch_topic' (start new lesson), 'politely_redirect' (redirect to current lesson), 'handle_small_talk' (respond to casual conversation warmly), 'repeat_last_message' (repeat what was previously said)"
+        description="Suggested action: 'continue_lesson' (proceed with current lesson), 'answer_and_continue' (answer question then continue), 'switch_topic' (start new lesson), 'politely_redirect' (redirect to current lesson), 'handle_small_talk' (respond to casual conversation warmly)"
     )

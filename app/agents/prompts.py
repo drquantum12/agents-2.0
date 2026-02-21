@@ -142,10 +142,7 @@ Be encouraging in your feedback regardless of the action!
 IMPORTANT:
 - Keep feedback SHORT (under 20 words).
 - NO special symbols (*, -, #) completely plain text for speech.
-- NO user names.
-- For 'proceed': Give warm, natural appreciation like "Exactly right!", "You nailed it!", "Spot on!", "That's a great answer!", "Brilliant!", "Perfect, you've got it!" followed by a brief acknowledgment of what they got right.
-- For 're-explain': Give empathetic encouragement like "Good try! Let me explain it differently.", "Almost there, let me help.", "Not quite, but that's okay! Let me clarify." Include a brief hint.
-- Make the feedback feel like a real conversation, not a robotic evaluation."""
+- NO user names."""
 
 
 REFLECTION_PROMPT = """You are a Reflection AI that identifies knowledge gaps to personalize future learning.
@@ -198,7 +195,6 @@ Guidelines:
    - 'new_topic': User explicitly wants to learn something new
    - 'off_topic_question': User has an unrelated question
    - 'small_talk': User is engaging in casual conversation, greetings, jokes, or sharing feelings
-   - 'repeat_request': User is asking you to repeat, say again, or couldn't hear what you said
 
 3. **suggested_action**:
    - 'continue_lesson': Default action if user is answering the lesson question
@@ -206,21 +202,16 @@ Guidelines:
    - 'switch_topic': If intent is 'new_topic'
    - 'politely_redirect': If intent is 'off_topic_question'
    - 'handle_small_talk': If intent is 'small_talk' - respond warmly then remind about lesson
-   - 'repeat_last_message': If intent is 'repeat_request' - user wants to hear it again
 
 CRITICAL RULE:
 If the last agent message ended with a question, and the user's response is a statement (even if incorrect), classify it as intent='answer' and action='continue_lesson'.
 Only classify as 'clarification' if the user explicitly asks a question (contains "?", "what", "why", "how", "I don't understand").
 Classify as 'small_talk' only if the user is clearly engaging in casual conversation completely unrelated to the lesson content (e.g., "how are you", "tell me a joke", "I'm bored").
-Classify as 'repeat_request' if the user asks you to repeat, say again, didn't hear, or wants to know what you said (e.g., "repeat that", "I couldn't hear", "say that again", "what did you say", "can you repeat", "one more time").
 
 Examples:
 - Agent: "Why do we need sun?" | User: "To dance" -> intent='answer' (incorrect answer is still an answer)
 - Agent: "Why do we need sun?" | User: "It provides energy" -> intent='answer'
 - Agent: "Why do we need sun?" | User: "Wait, what is energy?" -> intent='clarification'
-- Agent: "Why do we need sun?" | User: "I couldn't hear, what did you ask?" -> intent='repeat_request'
-- Agent: "Why do we need sun?" | User: "Can you repeat that?" -> intent='repeat_request'
-- Agent: "Why do we need sun?" | User: "Say that again please" -> intent='repeat_request'
 
 Current topic: "Photosynthesis"
 User query: "What about cellular respiration?" 

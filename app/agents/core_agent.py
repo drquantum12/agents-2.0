@@ -18,7 +18,6 @@ from app.agents.prompts import (
 import logging
 import operator
 import re
-import random
 from app.agents.schemas import LessonPlanSchema, EvaluationSchema, TopicAnalysisSchema
 import json
 
@@ -53,21 +52,6 @@ SMALL_TALK_PATTERNS = [
     r"^you'?re?\s+(funny|cool|nice|great|awesome)",
 ]
 
-# Patterns for detecting repeat/replay requests - fast path before LLM call
-REPEAT_REQUEST_PATTERNS = [
-    r"(couldn'?t|can'?t|could\s+not|did\s+not|didn'?t)\s+(hear|understand|catch|get)",
-    r"(repeat|say\s+(that|it|this)\s+again)",
-    r"(come\s+again|pardon|once\s+more|one\s+more\s+time)",
-    r"what\s+(did|was)\s+you\s+(say|ask)",
-    r"(say|tell|ask)\s+(that|it|me)\s+again",
-    r"(again\s+please|please\s+again|please\s+repeat)",
-    r"^again$",
-    r"(can|could)\s+you\s+(repeat|say\s+(that|it)\s+again)",
-    r"i\s+missed\s+(that|it|what\s+you\s+said)",
-    r"what\s+(question|did\s+you\s+ask)",
-    r"(speak|talk)\s+(louder|up)",
-]
-
 
 def is_small_talk(query: str) -> bool:
     """Fast rule-based detection of small talk queries. Zero LLM cost."""
@@ -75,16 +59,6 @@ def is_small_talk(query: str) -> bool:
     # Small talk is typically short
     if len(query_lower.split()) <= 10:
         for pattern in SMALL_TALK_PATTERNS:
-            if re.search(pattern, query_lower):
-                return True
-    return False
-
-
-def is_repeat_request(query: str) -> bool:
-    """Fast rule-based detection of repeat/replay requests. Zero LLM cost."""
-    query_lower = query.strip().lower()
-    if len(query_lower.split()) <= 15:
-        for pattern in REPEAT_REQUEST_PATTERNS:
             if re.search(pattern, query_lower):
                 return True
     return False
@@ -366,27 +340,6 @@ def analyze_topic_context(state: AgentState) -> dict:
     latest_user_query = user_messages[-1].content
     last_agent_message = ai_messages[-1].content if ai_messages else ""
     
-    # FAST PATH: Detect repeat requests without LLM call
-    if is_repeat_request(latest_user_query):
-        logger.info("Repeat request detected (fast path), replaying last AI message")
-        if last_agent_message:
-            repeat_prefixes = [
-                "Sure, let me repeat that. ",
-                "No problem, here it is again. ",
-                "Of course, I will say it again. ",
-                "Absolutely, let me repeat. ",
-                "No worries, here you go. ",
-            ]
-            prefix = random.choice(repeat_prefixes)
-            repeated_msg = AIMessage(content=prefix + last_agent_message)
-        else:
-            repeated_msg = AIMessage(content="I am sorry, I do not have anything to repeat yet. Let us continue with our lesson!")
-        
-        return {
-            "messages": [repeated_msg],
-            "last_action": "repeated"
-        }
-    
     # Get current step content
     step_content = ""
     if lesson_plan and lesson_step <= len(lesson_plan):
@@ -436,22 +389,11 @@ def analyze_topic_context(state: AgentState) -> dict:
                 }
             
             elif suggested_action == 'answer_and_continue':
-                # User has a related question, answer it briefly then re-ask the question
+                # User has a related question, answer it briefly then continue
                 logger.info("User has a related question, will answer and continue")
                 
-                # Generate a brief answer and re-ask the pending question
-                answer_prompt = f"""The student asked a clarification question during a lesson on '{topic}'.
-Answer their question briefly (1-2 sentences), then naturally re-ask the question you had previously asked.
-
-Student's clarification: {latest_user_query}
-Your previous message (which contained a question): {last_agent_message[:300]}
-
-Guidelines:
-- Answer the clarification briefly
-- Then naturally transition back to the question you asked before, e.g. "So coming back to my question..."
-- Keep total response under 60 words
-- No special symbols
-- Do NOT re-explain the whole concept, just answer their question and re-ask yours"""
+                # Generate a brief answer
+                answer_prompt = f"Briefly answer this question about {topic}: {latest_user_query}\nKeep it to 2-3 sentences, then remind them we'll continue with step {lesson_step}."
                 answer_response = llm.invoke(answer_prompt)
                 
                 answer_msg = AIMessage(content=answer_response.content)
@@ -484,28 +426,6 @@ Guidelines:
                 return {
                     "messages": [AIMessage(content=small_talk_response + reminder)],
                     "last_action": "small_talk_responded"
-                }
-            
-            elif suggested_action == 'repeat_last_message':
-                # User wants to hear the last message again
-                logger.info("Repeat request detected, replaying last AI message")
-                
-                if last_agent_message:
-                    repeat_prefixes = [
-                        "Sure, let me repeat that. ",
-                        "No problem, here it is again. ",
-                        "Of course, I will say it again. ",
-                        "Absolutely, let me repeat. ",
-                        "No worries, here you go. ",
-                    ]
-                    prefix = random.choice(repeat_prefixes)
-                    repeated_msg = AIMessage(content=prefix + last_agent_message)
-                else:
-                    repeated_msg = AIMessage(content="I'm sorry, I don't have anything to repeat yet. Let's continue with our lesson!")
-                
-                return {
-                    "messages": [repeated_msg],
-                    "last_action": "repeated"
                 }
             
             else:  # continue_lesson
@@ -585,7 +505,7 @@ def reflect_on_knowledge_gaps(state: AgentState) -> dict:
         }
 
 
-def should_continue(state: AgentState) -> Literal["generate_explanation", "evaluate_response", "reflect", "analyze_topic", "plan_lesson", "end"]:
+def should_continue(state: AgentState) -> Literal["generate_explanation", "evaluate_response", "reflect", "end"]:
     """
     Conditional routing function.
     Decides which node to call next based on the current state.
@@ -623,13 +543,9 @@ def should_continue(state: AgentState) -> Literal["generate_explanation", "evalu
         else:
             return "generate_explanation"
     
-    # If we answered a clarification question, wait for user's next response (don't re-explain)
+    # If we answered a question, continue with current step
     if last_action == 'answered_question':
-        return "end"
-    
-    # If we repeated the last message, wait for user response
-    if last_action == 'repeated':
-        return "end"
+        return "generate_explanation"
     
     # If we redirected user, end turn and wait for response
     if last_action == 'redirected':
