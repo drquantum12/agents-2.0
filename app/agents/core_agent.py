@@ -90,6 +90,36 @@ def is_repeat_request(query: str) -> bool:
     return False
 
 
+def pick_filler_phrase(query: str) -> str:
+    """Pick a short contextual filler phrase based on query type. Zero LLM cost."""
+    if is_repeat_request(query):
+        return random.choice([
+            "Sure, one moment.",
+            "Of course, let me repeat.",
+            "No problem, here it is again.",
+        ])
+    if is_small_talk(query):
+        return random.choice([
+            "Hey!",
+            "Hmm, let me think.",
+        ])
+    # Check if it looks like an answer (short, declarative)
+    word_count = len(query.strip().split())
+    if word_count <= 6:
+        return random.choice([
+            "Hmm, let me check.",
+            "Okay, let me think about that.",
+            "Alright, give me a moment.",
+        ])
+    # Longer input — likely a question or new topic
+    return random.choice([
+        "Interesting, let me think.",
+        "Good question, give me a second.",
+        "Let me think about that.",
+        "Hmm, one moment.",
+    ])
+
+
 def handle_small_talk(query: str) -> str:
     """Handle casual conversation with a single fast LLM call. Bypasses entire graph."""
     prompt = SMALL_TALK_PROMPT.format(query=query)
@@ -111,6 +141,7 @@ class AgentState(TypedDict):
     context_switch: bool  # Flag indicating if user wants to switch topics
     pending_topic: str  # New topic user wants to learn (if switching)
     feedback: str  # Feedback from the evaluator (e.g., "Great job!")
+    last_explanation: str  # The last lesson explanation/question from generate_explanation (not small talk/filler)
 
 # Setup MongoDB checkpointer (for persistence/short-term memory)
 checkpointer = MongoDBSaver(
@@ -240,7 +271,8 @@ def generate_explanation(state: AgentState) -> dict:
         return {
             "messages": [explanation_message],
             "last_action": "explained",
-            "feedback": ""  # Clear feedback after using it
+            "feedback": "",  # Clear feedback after using it
+            "last_explanation": final_content  # Persist so we always know the real lesson question
         }
         
     except Exception as e:
@@ -270,7 +302,9 @@ def evaluate_response(state: AgentState) -> dict:
         return {"last_action": "proceed"}
     
     latest_user_message = user_messages[-1].content
-    last_agent_question = ai_messages[-1].content if ai_messages else "the previous question"
+    # Use last_explanation (the real lesson question) instead of ai_messages[-1]
+    # which could be small talk, redirect, or repeat filler
+    last_agent_question = state.get('last_explanation', '') or (ai_messages[-1].content if ai_messages else "the previous question")
     
     logger.info(f"Evaluating user response: {latest_user_message[:50]}...")
     
@@ -364,7 +398,9 @@ def analyze_topic_context(state: AgentState) -> dict:
     logger.info("New user message detected, proceeding with analysis")
     
     latest_user_query = user_messages[-1].content
-    last_agent_message = ai_messages[-1].content if ai_messages else ""
+    # Use last_explanation (the real lesson question) instead of ai_messages[-1]
+    # which could be small talk, redirect, or repeat filler
+    last_agent_message = state.get('last_explanation', '') or (ai_messages[-1].content if ai_messages else "")
     
     # FAST PATH: Detect repeat requests without LLM call
     if is_repeat_request(latest_user_query):
@@ -827,7 +863,8 @@ def run_agent(user: dict, query: str, session_id: str):
                 "knowledge_gaps": [],
                 "last_action": "initial",
                 "context_switch": False,
-                "pending_topic": ""
+                "pending_topic": "",
+                "last_explanation": ""
             }
         
         # Invoke agent
