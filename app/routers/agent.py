@@ -45,36 +45,10 @@ async def device_voice_assistant(request: Request,
     session_id = get_or_create_device_session_id(user_id=user["_id"])
     language_code = result.language_code if result.language_code else "en-IN"
 
-    # Pick a contextual filler phrase based on query type (zero LLM cost)
-    filler_phrase = pick_filler_phrase(result.transcript)
-    logger.info(f"Filler phrase: '{filler_phrase}' for query: {result.transcript[:50]}")
-
-    # Launch filler TTS and agent processing CONCURRENTLY
-    # Filler TTS completes in ~200-400ms, agent takes ~2-5s
-    # User hears filler audio almost immediately instead of silence
-    filler_task = asyncio.create_task(generate_filler_audio(filler_phrase, language_code=language_code))
     agent_task = asyncio.create_task(asyncio.to_thread(run_agent, user=user, query=result.transcript, session_id=session_id))
 
-    # Wait for filler audio first (should be very fast ~200-400ms)
-    filler_audio = await filler_task
 
-    async def combined_audio_stream():
-        # 1. Yield filler audio immediately so user hears something right away
-        if filler_audio:
-            yield filler_audio
-            await asyncio.sleep(0)
-
-        # 2. Wait for agent response (may already be done by now since filler was fast)
-        response = await agent_task
-
-        # 3. Translate if needed
-        final_response = response
-        if language_code != "en-IN":
-            final_response = await asyncio.to_thread(translate_text, response, "en-IN", language_code)
-
-        # 4. Stream the actual response audio with sentence-level pipelining
-        async for chunk in sentence_pipelined_tts(final_response, language_code=language_code):
-            yield chunk
+    response = await agent_task
 
     headers = {
             "Cache-Control": "no-cache",
@@ -83,7 +57,7 @@ async def device_voice_assistant(request: Request,
         }
     
     return StreamingResponse(
-        combined_audio_stream(),
+        sentence_pipelined_tts(response, language_code=language_code),
         media_type="audio/mpeg",
         headers=headers
     )
