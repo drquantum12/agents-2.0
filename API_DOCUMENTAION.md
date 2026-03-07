@@ -14,8 +14,14 @@
 4. [Messages](#4-messages)
 5. [Agent (AI Tutor)](#5-agent-ai-tutor)
 6. [Devices](#6-devices)
-7. [Data Models](#7-data-models)
-8. [Error Responses](#8-error-responses)
+   - [POST /devices/online/{device_id}](#post-devicesonlinedevice_id)
+   - [GET /devices/config](#get-devicesconfig)
+   - [PATCH /devices/config](#patch-devicesconfig)
+7. [Notifications](#7-notifications)
+   - [GET /notifications](#get-notifications)
+   - [DELETE /notifications/{notification_id}](#delete-notificationsnotification_id)
+8. [Data Models](#8-data-models)
+9. [Error Responses](#9-error-responses)
 
 ---
 
@@ -421,7 +427,129 @@ Notify the server that a device is online.
 
 ---
 
-## 7. Data Models
+### GET `/devices/config`
+Get the device configuration for the currently authenticated user. If no configuration exists, a default one is automatically created and returned.
+
+**Auth:** Required (Bearer token)
+
+**Response `200`:**
+```json
+{
+  "id": "uuid",
+  "user_id": "uuid",
+  "learning_mode": "Normal",
+  "response_type": "Detailed",
+  "difficulty_level": "Beginner",
+  "created_at": "2026-03-06T10:00:00Z",
+  "updated_at": null
+}
+```
+
+**Errors:** `401` Unauthorized
+
+---
+
+### PATCH `/devices/config`
+Partially update the device configuration for the currently authenticated user. Only include the fields you want to change.
+
+**Auth:** Required (Bearer token)
+
+**Request Body:**
+```json
+{
+  "learning_mode": "Strict",
+  "response_type": "Concise",
+  "difficulty_level": "Advanced"
+}
+```
+
+| Field | Type | Required | Allowed Values |
+|---|---|---|---|
+| `learning_mode` | string | No | `"Strict"`, `"Normal"` |
+| `response_type` | string | No | `"Detailed"`, `"Concise"` |
+| `difficulty_level` | string | No | `"Beginner"`, `"Intermediate"`, `"Advanced"` |
+
+**Response `200`:**
+```json
+{
+  "id": "uuid",
+  "user_id": "uuid",
+  "learning_mode": "Strict",
+  "response_type": "Concise",
+  "difficulty_level": "Advanced",
+  "created_at": "2026-03-06T10:00:00Z",
+  "updated_at": "2026-03-06T12:30:00Z"
+}
+```
+
+**Errors:** `400` Invalid field value, `401` Unauthorized
+
+---
+
+## 7. Notifications
+
+**Prefix:** `/api/v1/notifications`  
+All endpoints require authentication.
+
+---
+
+### GET `/notifications`
+Get paginated notifications for the current user. Returns 5 notifications per page, sorted newest first.
+
+**Query Parameters:**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `page` | integer | `1` | 1-based page number, must be ≥ 1 |
+
+**Response `200`:**
+```json
+{
+  "page": 1,
+  "page_size": 5,
+  "total": 23,
+  "has_next": true,
+  "notifications": [
+    {
+      "id": "uuid",
+      "user_id": "uuid",
+      "message": "Your session is about to expire.",
+      "type": "warn",
+      "created_at": "2026-03-06T10:00:00Z"
+    }
+  ]
+}
+```
+
+| Response Field | Type | Description |
+|---|---|---|
+| `page` | integer | Current page number |
+| `page_size` | integer | Number of items per page (always `5`) |
+| `total` | integer | Total notifications for this user |
+| `has_next` | boolean | Whether more pages exist |
+| `notifications` | array | Array of notification objects |
+
+**Errors:** `400` Invalid page number, `401` Unauthorized
+
+---
+
+### DELETE `/notifications/{notification_id}`
+Delete a specific notification by its ID. The notification must belong to the authenticated user.
+
+**Path Parameter:** `notification_id` — The `_id` of the notification to delete.
+
+**Response `200`:**
+```json
+{
+  "message": "Notification deleted successfully"
+}
+```
+
+**Errors:** `401` Unauthorized, `404` Notification not found
+
+---
+
+## 8. Data Models
 
 ### User
 | Field | Type | Description |
@@ -454,9 +582,29 @@ Notify the server that a device is online.
 | `content` | string | Message text content |
 | `created_at` | datetime | Message timestamp |
 
+### DeviceConfiguration
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Unique config ID (UUID) |
+| `user_id` | string | Owner's user ID |
+| `learning_mode` | string | `"Strict"` or `"Normal"` |
+| `response_type` | string | `"Detailed"` or `"Concise"` |
+| `difficulty_level` | string | `"Beginner"`, `"Intermediate"`, or `"Advanced"` |
+| `created_at` | datetime | Config creation timestamp |
+| `updated_at` | datetime \| null | Last update timestamp |
+
+### Notification
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Unique notification ID |
+| `user_id` | string | Owner's user ID |
+| `message` | string | Notification text |
+| `type` | string | `"info"`, `"warn"`, or `"err"` |
+| `created_at` | datetime | Creation timestamp |
+
 ---
 
-## 8. Error Responses
+## 9. Error Responses
 
 All errors follow this structure:
 ```json

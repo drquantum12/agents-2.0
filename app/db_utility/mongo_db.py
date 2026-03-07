@@ -46,6 +46,14 @@ class SessionSchema(TypedDict):
     _id: str
     messages: List[MessageSchema]
 
+class DeviceConfigurationSchema(TypedDict):
+    """Device configuration collection schema"""
+    _id: str
+    user_id: str  # Reference to User._id
+    learning_mode: str  # Strict / Normal
+    response_type: str  # Detailed / Concise
+    difficulty_level: str  # Beginner / Intermediate / Advanced
+
 
 class MongoDBClient:
     """
