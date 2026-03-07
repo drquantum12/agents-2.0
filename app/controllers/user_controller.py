@@ -106,6 +106,9 @@ class UserController:
         Raises:
             HTTPException: If user not found
         """
+        from app.controllers.device_controller import release_devices_on_account_deletion
+        release_devices_on_account_deletion(user_id)
+
         result = self.users_collection.delete_one({"_id": user_id})
         
         if result.deleted_count == 0:

@@ -70,6 +70,7 @@ package "Data Layer" as DataLayer #FBE9E7 {
     database "users" as UsersCol
     database "conversations" as ConvCol
     database "sessions\n(messages + agent checkpoints)" as SessionsCol
+    database "devices\n(ownership ledger)" as DevicesCol
     database "device_config" as DevConfigCol
     database "notifications" as NotifCol
     database "messages\n(future use)" as MsgsCol
@@ -120,6 +121,7 @@ ConvRouter --> ConvCtrl
 MsgRouter --> MsgCtrl
 AgentRouter --> CoreAgent
 DeviceRouter --> DevCtrl
+DeviceRouter --> DeviceCtrl
 NotifRouter --> NotifCtrl
 
 ' Auth → Firebase util
@@ -132,6 +134,9 @@ ConvCtrl --> ConvCol
 ConvCtrl --> SessionsCol
 MsgCtrl --> SessionsCol
 DevCtrl --> DevConfigCol
+DeviceCtrl --> DevicesCol
+DeviceCtrl --> DevConfigCol : ownership change
+DeviceCtrl --> NotifCol : transfer notification
 NotifCtrl --> NotifCol
 
 ' Security → DB
@@ -539,13 +544,49 @@ entity "Milvus: educational_content" as VectorDB {
   similarity_threshold : 0.6
 }
 
+entity "devices" as Devices {
+  * _id : String <<device_id = PK>>
+  --
+  device_id : String
+  firmware_version : String | null
+  hardware_revision : String | null
+  owner_user_id : String | null  <<FK → users._id, index>>
+  ownership_status : "unclaimed" | "active" | "transferring"  <<index>>
+  claimed_at : DateTime | null
+  last_provisioned_at : DateTime | null
+  is_online : Boolean
+  last_seen_at : DateTime | null  <<index>>
+  ip_address : String | null
+  pending_transfer : EmbeddedTransfer | null  <<TTL sparse index>>
+  ownership_history : Array<OwnershipEntry>  // max 20 entries
+  created_at : DateTime
+  updated_at : DateTime
+}
+
+entity "EmbeddedTransfer" as EmbTransfer {
+  new_user_id : String
+  initiated_at : DateTime
+  expires_at : DateTime  // +15 min — TTL index target
+}
+
+entity "OwnershipEntry" as OwnEntry {
+  user_id : String
+  claimed_at : DateTime
+  released_at : DateTime | null
+  release_reason : "transfer" | "manual_unpair" | "admin" | "account_deleted" | null
+  transfer_to_user : String | null
+}
+
 ' Relationships
 Users ||--o{ Conversations : "user_id"
 Users ||--o| DeviceConfig : "user_id"
 Users ||--o{ Notifications : "user_id"
 Users ||--o| Metrics : "doc_id = user_id"
+Users ||--o{ Devices : "owner_user_id"
 Conversations ||--|| Sessions : "_id (1:1 pair)"
 Sessions ||--o{ EmbMsg : "messages[]"
 Conversations ||--o{ Messages : "conversation_id\n(future)"
+Devices ||--o| EmbTransfer : "pending_transfer"
+Devices ||--o{ OwnEntry : "ownership_history[]"
 
 @enduml

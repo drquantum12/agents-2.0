@@ -15,6 +15,10 @@
 5. [Agent (AI Tutor)](#5-agent-ai-tutor)
 6. [Devices](#6-devices)
    - [POST /devices/online/{device_id}](#post-devicesonlinedevice_id)
+   - [GET /devices/mine](#get-devicesmine)
+   - [GET /devices/{device_id}/status](#get-devicesdevice_idstatus)
+   - [POST /devices/{device_id}/unpair](#post-devicesdevice_idunpair)
+   - [GET /devices/{device_id}/history](#get-devicesdevice_idhistory)
    - [GET /devices/config](#get-devicesconfig)
    - [PATCH /devices/config](#patch-devicesconfig)
 7. [Notifications](#7-notifications)
@@ -401,29 +405,141 @@ X-Accel-Buffering: no
 
 ## 6. Devices
 
-**Prefix:** `/api/v1/devices`
+**Prefix:** `/api/v1/devices`  
+Endpoints marked **Auth required** need `Authorization: Bearer <token>`.
+
+> **Rate limit:** `POST /devices/online/{device_id}` is limited to **5 requests per minute per device**. Exceeding this returns `429 Too Many Requests`.
 
 ---
 
 ### POST `/devices/online/{device_id}`
-Notify the server that a device is online.
+Called by the IoT device after every successful WiFi connection. Manages device ownership atomically — handles first claim, re-provisioning by the same user, and ownership transfer.
 
-**Path Parameter:** `device_id` — identifier for the device.
+**Auth:** Required  
+**Path Parameter:** `device_id` — hardware serial or MAC address (used as `_id` in the `devices` collection).
 
 **Request Body:**
 ```json
 {
-  "device_id": "device-abc",
-  "status": "online"
+  "firmware_version": "1.0.3",
+  "hardware_revision": "rev-B"
 }
 ```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `firmware_version` | string | Yes | Current firmware version string |
+| `hardware_revision` | string | No | Hardware revision identifier |
+
+**Response `200` — Brand-new device (first claim):**
+```json
+{ "status": "claimed", "device_id": "esp32-aabbcc" }
+```
+
+**Response `200` — Same user re-provisioning:**
+```json
+{ "status": "re_provisioned", "device_id": "esp32-aabbcc" }
+```
+
+**Response `200` — Ownership transferred to new user:**
+```json
+{ "status": "transferred", "device_id": "esp32-aabbcc" }
+```
+
+**Errors:** `401` Unauthorized (causes ESP32 FSM to re-enter BLE config mode), `429` Rate limit exceeded
+
+---
+
+### GET `/devices/mine`
+Returns all active devices currently owned by the authenticated user.
+
+**Auth:** Required
 
 **Response `200`:**
 ```json
 {
-  "message": "Device online"
+  "devices": [
+    {
+      "device_id": "esp32-aabbcc",
+      "firmware_version": "1.0.3",
+      "ownership_status": "active",
+      "is_online": true,
+      "last_seen_at": "2026-03-07T08:00:00Z"
+    }
+  ]
 }
 ```
+
+**Errors:** `401` Unauthorized
+
+---
+
+### GET `/devices/{device_id}/status`
+Returns the online status and ownership info for a specific device. Only the current owner may query this.
+
+**Auth:** Required  
+**Path Parameter:** `device_id`
+
+**Response `200`:**
+```json
+{
+  "device_id": "esp32-aabbcc",
+  "is_online": true,
+  "ownership_status": "active",
+  "last_seen_at": "2026-03-07T08:00:00Z",
+  "firmware_version": "1.0.3"
+}
+```
+
+**Errors:** `401` Unauthorized, `403` Not your device, `404` Device not found
+
+---
+
+### POST `/devices/{device_id}/unpair`
+Voluntarily releases the user's ownership of a device. Sets the device to `unclaimed` and clears `device_id` from the user's `device_config`.
+
+**Auth:** Required  
+**Path Parameter:** `device_id`
+
+**Response `200`:**
+```json
+{ "success": true }
+```
+
+**Errors:** `401` Unauthorized, `403` Not your device, `404` Device not found
+
+---
+
+### GET `/devices/{device_id}/history`
+Returns the full append-only ownership history for a device. Only the current owner may query this.
+
+**Auth:** Required  
+**Path Parameter:** `device_id`
+
+**Response `200`:**
+```json
+{
+  "device_id": "esp32-aabbcc",
+  "ownership_history": [
+    {
+      "user_id": "uuid-user-1",
+      "claimed_at": "2026-01-01T10:00:00Z",
+      "released_at": "2026-02-15T09:30:00Z",
+      "release_reason": "transfer",
+      "transfer_to_user": "uuid-user-2"
+    },
+    {
+      "user_id": "uuid-user-2",
+      "claimed_at": "2026-02-15T09:30:00Z",
+      "released_at": null,
+      "release_reason": null,
+      "transfer_to_user": null
+    }
+  ]
+}
+```
+
+**Errors:** `401` Unauthorized, `403` Not your device, `404` Device not found
 
 ---
 
@@ -582,11 +698,40 @@ Delete a specific notification by its ID. The notification must belong to the au
 | `content` | string | Message text content |
 | `created_at` | datetime | Message timestamp |
 
+### Device
+| Field | Type | Description |
+|---|---|---|
+| `device_id` | string | Hardware serial / MAC — primary key |
+| `firmware_version` | string \| null | Current firmware version |
+| `hardware_revision` | string \| null | Hardware revision identifier |
+| `owner_user_id` | string \| null | Current owner's user ID (`null` = unclaimed) |
+| `ownership_status` | string | `"unclaimed"`, `"active"`, or `"transferring"` |
+| `claimed_at` | datetime \| null | When the current owner claimed the device |
+| `last_provisioned_at` | datetime \| null | Last `POST /devices/online` timestamp |
+| `is_online` | boolean | Whether device connected successfully last time |
+| `last_seen_at` | datetime \| null | Last successful connection timestamp |
+| `ip_address` | string \| null | Client IP at last connection |
+| `pending_transfer` | object \| null | In-flight transfer window (TTL 15 min) |
+| `ownership_history` | array | Append-only ownership audit trail (max 20 entries) |
+| `created_at` | datetime | First registration timestamp |
+| `updated_at` | datetime | Last document update timestamp |
+
+### OwnershipHistoryEntry
+| Field | Type | Description |
+|---|---|---|
+| `user_id` | string | User who held ownership |
+| `claimed_at` | datetime | When ownership started |
+| `released_at` | datetime \| null | When ownership ended (`null` = current owner) |
+| `release_reason` | string \| null | `"transfer"`, `"manual_unpair"`, `"admin"`, or `"account_deleted"` |
+| `transfer_to_user` | string \| null | Next owner's user ID (only set on `"transfer"`) |
+
 ### DeviceConfiguration
 | Field | Type | Description |
 |---|---|---|
 | `id` | string | Unique config ID (UUID) |
 | `user_id` | string | Owner's user ID |
+| `device_id` | string \| null | Linked device hardware ID |
+| `device_online` | boolean | Whether the linked device is currently online |
 | `learning_mode` | string | `"Strict"` or `"Normal"` |
 | `response_type` | string | `"Detailed"` or `"Concise"` |
 | `difficulty_level` | string | `"Beginner"`, `"Intermediate"`, or `"Advanced"` |
@@ -617,8 +762,10 @@ All errors follow this structure:
 |---|---|
 | `400` | Bad Request — invalid input or duplicate resource |
 | `401` | Unauthorized — missing, invalid, or expired token |
+| `403` | Forbidden — authenticated but not authorised for this resource |
 | `404` | Not Found — requested resource does not exist |
 | `422` | Unprocessable Entity — request body validation failed |
+| `429` | Too Many Requests — rate limit exceeded (retry after 60 s) |
 | `500` | Internal Server Error — unexpected server-side failure |
 
 ### Authentication Errors
