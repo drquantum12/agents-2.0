@@ -35,8 +35,12 @@ package "FastAPI Application  /api/v1" as FastAPI #FFF9E6 {
     [conversation.py\nCRUD /conversations] as ConvRouter
     [message.py\nPOST|GET /messages] as MsgRouter
     [agent.py\nPOST /agent/query\nPOST /agent/device-voice-assistant] as AgentRouter
-    [device.py\nGET|PATCH /devices/config\nPOST /devices/online/:id] as DeviceRouter
+    [device.py\nPOST /devices/online/:id\nPOST /devices/heartbeat/:id\nGET /devices/mine\nGET|PATCH /devices/config\nGET /devices/:id/status\nPOST /devices/:id/unpair\nGET /devices/:id/history] as DeviceRouter
     [notification.py\nGET /notifications\nDELETE /notifications/:id] as NotifRouter
+  }
+
+  package "Legacy Endpoints (main.py)" as LegacyEndpoints #FFF3E0 {
+    [POST /raw-voice-assistant\nPOST /voice-assistant\nGET /test-audio-generator\nGET /testing-audio-stream] as LegacyRoutes
   }
 
   package "Utility / Security" as UtilPkg #F1F8E9 {
@@ -50,6 +54,7 @@ package "FastAPI Application  /api/v1" as FastAPI #FFF9E6 {
     [ConversationController\nCRUD conversations + sessions] as ConvCtrl
     [MessageController\nappend · fetch messages in session] as MsgCtrl
     [DeviceConfigController\nget/upsert device learning config] as DevCtrl
+    [DeviceController\nupsert config · notify transfer\nrelease on account deletion] as DeviceCtrl
     [NotificationController\npaginated fetch · ownership delete] as NotifCtrl
   }
 
@@ -57,9 +62,9 @@ package "FastAPI Application  /api/v1" as FastAPI #FFF9E6 {
     [core_agent.py\nLangGraph StateGraph\nrun_agent()] as CoreAgent
     [agent_memory_controller.py\nchat history (last 2 msgs)\ndevice_session_id] as MemCtrl
     [llm.py\nGemini 2.0 flash-lite\nChatGoogleGenerativeAI] as LLM
-    [prompts.py\n12 prompt templates] as Prompts
-    [schemas.py\nTool-call Pydantic schemas\nQueryClassification · LessonPlan\nEvaluation · TopicAnalysis] as Schemas
-    [utility.py\nSarvamAI TTS pipeline\nsentence_pipelined_tts()\ntranslate_text()] as AgentUtil
+    [prompts.py\n9 agent + 2 legacy prompts] as Prompts
+    [schemas.py\nTool-call Pydantic schemas\nQueryClassification · LessonPlan\nEvaluation · TopicAnalysis\n(intent: answer|clarification|new_topic\n off_topic|small_talk|repeat)] as Schemas
+    [utility.py\nSarvamAI TTS pipeline\nsentence_pipelined_tts()\ntts_sentence() · split_into_sentences()\ngenerate_filler_audio()\ntranslate_text() · chunk_text()] as AgentUtil
   }
 }
 
@@ -104,6 +109,7 @@ MobileApp --> AgentRouter : text query
 MobileApp --> DeviceRouter
 MobileApp --> NotifRouter
 Device --> AgentRouter : raw WAV
+Device --> LegacyRoutes : raw WAV (legacy)
 
 ' Router → Security
 AuthRouter ..> Security : get_current_user()
@@ -154,6 +160,10 @@ MemCtrl --> SessionsCol : chat history\n+ checkpoints
 CoreAgent --> SessionsCol : MongoDBSaver\ncheckpoint
 CoreAgent --> VectorCol : get_similar_documents()
 
+' Legacy endpoints wiring
+LegacyRoutes --> Sarvam : STT + TTS
+LegacyRoutes --> Gemini : LLM (legacy prompts)
+
 ' External service calls
 LLM --> Gemini : inference
 VectorCol ..> EmbedAPI : embed query
@@ -194,6 +204,7 @@ note right
   · awaiting_lesson_confirmation
   · pending_topic, feedback
   · last_explanation, last_action
+  · session_id
 end note
 
 :Load checkpoint from MongoDB\n(MongoDBSaver — thread_id = session_id);
@@ -219,12 +230,14 @@ if (awaiting_lesson_confirmation == True?) then (yes)
 elseif (mode == "explanation"\nAND topic AND lesson_plan?) then (yes)
   :Node: **analyze_topic**\n<i>fast-path: repeat / small_talk</i>\n<i>else: LLM + TopicAnalysisSchema tool</i>;
   note right
-    TopicAnalysisSchema intent values:
-    · context_analyzed
-    · exited_lesson
-    · small_talk / repeated
-    · redirected / waiting
-    · answered_question
+    TopicAnalysisSchema:
+    **intent**: answer | clarification
+    | new_topic | off_topic_question
+    | small_talk | repeat_request
+    **suggested_action**:
+    continue_lesson | answer_and_continue
+    | switch_topic | politely_redirect
+    | handle_small_talk | repeat_last_message
   end note
   if (intent == "context_analyzed") then
     :Node: **evaluate_response**\n<i>LLM + EvaluationSchema tool</i>\n→ is_correct, feedback, understanding_level;
@@ -491,9 +504,12 @@ entity "device_config" as DeviceConfig {
   * _id : String <<UUID>> <<PK>>
   --
   user_id : String  <<FK → users._id, unique index>>
+  device_id : String | null  // linked device
+  device_online : Boolean | null
   learning_mode : "Strict" | "Normal"
   response_type : "Detailed" | "Concise"
   difficulty_level : "Beginner" | "Intermediate" | "Advanced"
+  last_seen_at : DateTime | null
   created_at : DateTime
   updated_at : DateTime | null
 }
@@ -551,7 +567,7 @@ entity "devices" as Devices {
   firmware_version : String | null
   hardware_revision : String | null
   owner_user_id : String | null  <<FK → users._id, index>>
-  ownership_status : "unclaimed" | "active" | "transferring"  <<index>>
+  ownership_status : "unclaimed" | "active"  <<index>>
   claimed_at : DateTime | null
   last_provisioned_at : DateTime | null
   is_online : Boolean

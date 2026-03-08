@@ -15,6 +15,7 @@
 5. [Agent (AI Tutor)](#5-agent-ai-tutor)
 6. [Devices](#6-devices)
    - [POST /devices/online/{device_id}](#post-devicesonlinedevice_id)
+   - [POST /devices/heartbeat/{device_id}](#post-devicesheartbeatdevice_id)
    - [GET /devices/mine](#get-devicesmine)
    - [GET /devices/{device_id}/status](#get-devicesdevice_idstatus)
    - [POST /devices/{device_id}/unpair](#post-devicesdevice_idunpair)
@@ -447,6 +448,20 @@ Called by the IoT device after every successful WiFi connection. Manages device 
 ```
 
 **Errors:** `401` Unauthorized (causes ESP32 FSM to re-enter BLE config mode), `429` Rate limit exceeded
+
+---
+
+### POST `/devices/heartbeat/{device_id}`
+Called periodically by the IoT device to signal that it is still online. Updates `last_seen_at`, `ip_address`, and `is_online` on the device document. Only the current owner's token is accepted.
+
+**Auth:** Required  
+**Path Parameter:** `device_id` — hardware serial or MAC address.
+
+**Request Body:** None
+
+**Response `204`:** No content (empty body on success)
+
+**Errors:** `401` Unauthorized, `404` Device not found or not owned by you
 
 ---
 

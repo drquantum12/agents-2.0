@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi import APIRouter, Depends, Request, HTTPException, Response
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta, timezone
@@ -187,6 +187,29 @@ async def device_online(
 
     return {"status": "transferred", "device_id": device_id}
 
+# for capturing device hearbeats
+@router.post("/heartbeat/{device_id}")
+async def device_heartbeat(
+    device_id: str,
+    request: Request,
+    calling_user: dict = Depends(get_current_user),
+):
+    now = datetime.now(timezone.utc)
+    client_ip = request.client.host if request.client else None
+
+    result = mongo_db["devices"].update_one(
+        {"_id": device_id, "owner_user_id": calling_user["_id"]},
+        {"$set": {
+            "last_seen_at": now,
+            "ip_address": client_ip,
+            "is_online": True,
+            "updated_at": now,
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Device not found or not owned by you")
+
+    return Response(status_code=204)
 
 @router.get("/mine")
 async def get_my_devices(
