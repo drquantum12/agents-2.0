@@ -16,6 +16,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["Agent"])
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
+# Language codes supported by Sarvam bulbul:v2 TTS + saaras:v2.5 STT
+SUPPORTED_LANGUAGE_CODES = {
+    "en-IN",  # English
+    "hi-IN",  # Hindi
+    "bn-IN",  # Bengali
+    "gu-IN",  # Gujarati
+    "kn-IN",  # Kannada
+    "ml-IN",  # Malayalam
+    "mr-IN",  # Marathi
+    "od-IN",  # Odia
+    "pa-IN",  # Punjabi
+    "ta-IN",  # Tamil
+    "te-IN",  # Telugu
+}
+
+UNSUPPORTED_LANGUAGE_MESSAGE = (
+    "I am sorry, I was not able to recognize your language. "
+    "Please try speaking in one of the supported languages: "
+    "English, Hindi, Bengali, Gujarati, Kannada, Malayalam, Marathi, Odia, Punjabi, Tamil, or Telugu."
+)
+
 # Tracks the active cancellation event per user so a new request can interrupt the current stream.
 _active_cancel_events: dict[str, asyncio.Event] = {}
 
@@ -59,7 +80,18 @@ async def device_voice_assistant(request: Request,
         )
     
     session_id = get_or_create_device_session_id(user_id=user["_id"])
-    language_code = result.language_code if result.language_code else "en-IN"
+    language_code = result.language_code if result.language_code else ""
+
+    # --- Unsupported / unrecognised language guard ---
+    if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
+        logger.warning(f"Unsupported or unrecognised language code: '{language_code}' — returning error audio")
+        error_audio = await generate_filler_audio(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN")
+        return StreamingResponse(
+            iter([error_audio]),
+            media_type="audio/mpeg",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+    # -------------------------------------------------
 
     # --- Interruption logic ---
     # Cancel any in-flight stream for this user before starting a new one.
@@ -75,6 +107,13 @@ async def device_voice_assistant(request: Request,
     agent_task = asyncio.create_task(asyncio.to_thread(run_agent, user=user, query=result.transcript, session_id=session_id))
 
     response = await agent_task
+
+    if language_code != "en-IN":
+        response = await asyncio.to_thread(
+            translate_text, response,
+            "en-IN",
+            language_code,
+        )
 
     headers = {
             "Cache-Control": "no-cache",

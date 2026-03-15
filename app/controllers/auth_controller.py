@@ -3,9 +3,9 @@ from datetime import datetime, timezone
 import uuid
 from typing import Dict, Any
 
-from app.models.user import UserCreate, UserInDB
+from app.models.user import UserRegister
 from app.db_utility.mongo_db import mongo_db
-from app.utility.security import get_password_hash, verify_password, create_access_token
+from app.utility.security import create_access_token
 from app.utility.firebase_init import verify_firebase_token
 
 
@@ -15,36 +15,50 @@ class AuthController:
     def __init__(self):
         self.users_collection = mongo_db["users"]
     
-    async def register_user(self, user_data: UserCreate) -> Dict[str, Any]:
+    async def register_user(self, user_data: UserRegister) -> Dict[str, Any]:
         """
-        Register a new user with email and password
+        Register a new user using a Firebase ID token.
+        The account is already created in Firebase on the client side;
+        this endpoint persists the user profile in MongoDB.
         
         Args:
-            user_data: User registration data
+            user_data: Firebase ID token + profile fields (name, grade, board, etc.)
             
         Returns:
             Dictionary containing user info and access token
             
         Raises:
-            HTTPException: If email is already registered
+            HTTPException: If the Firebase token is invalid or email is already registered
         """
+        try:
+            decoded_token = verify_firebase_token(user_data.id_token)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid Firebase token: {e}"
+            )
+
+        email = decoded_token.get("email")
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Token is missing email claim"
+            )
+        photo_url = decoded_token.get("picture")
+
         # Check if user already exists
-        if self.users_collection.find_one({"email": user_data.email}):
+        if self.users_collection.find_one({"email": email}):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
             )
         
-        # Create new user
         user_id = str(uuid.uuid4())
-        hashed_password = get_password_hash(user_data.password) if user_data.password else None
-        
         new_user = {
             "_id": user_id,
             "name": user_data.name,
-            "email": user_data.email,
-            "password": hashed_password,
-            "photo_url": None,
+            "email": email,
+            "photo_url": photo_url,
             "grade": user_data.grade,
             "board": user_data.board,
             "personalized_response": user_data.personalized_response,
@@ -54,7 +68,6 @@ class AuthController:
         
         self.users_collection.insert_one(new_user)
         
-        # Generate access token
         token = create_access_token({"sub": user_id})
         
         return {
@@ -71,26 +84,42 @@ class AuthController:
             "token": token
         }
     
-    async def login_user(self, email: str, password: str) -> Dict[str, Any]:
+    async def login_user(self, id_token: str) -> Dict[str, Any]:
         """
-        Authenticate user with email and password
+        Authenticate user via a Firebase ID token (covers both email/password
+        and Google sign-in, and honours Firebase-side password resets).
         
         Args:
-            email: User email
-            password: User password
+            id_token: Firebase ID token obtained on the client after
+                      signInWithEmailAndPassword or signInWithGoogle.
             
         Returns:
             Dictionary containing user info and access token
             
         Raises:
-            HTTPException: If credentials are invalid
+            HTTPException: If the Firebase token is invalid or the user is
+                           not found in the database.
         """
-        user = self.users_collection.find_one({"email": email})
-        
-        if not user or not verify_password(password, user.get("password", "")):
+        try:
+            decoded_token = verify_firebase_token(id_token)
+        except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
+                detail=f"Invalid Firebase token: {e}"
+            )
+
+        email = decoded_token.get("email")
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Token is missing email claim"
+            )
+
+        user = self.users_collection.find_one({"email": email})
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No account found for this email. Please register first."
             )
         
         # Generate access token

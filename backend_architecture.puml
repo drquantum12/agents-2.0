@@ -35,7 +35,7 @@ package "FastAPI Application  /api/v1" as FastAPI #FFF9E6 {
     [conversation.py\nCRUD /conversations] as ConvRouter
     [message.py\nPOST|GET /messages] as MsgRouter
     [agent.py\nPOST /agent/query\nPOST /agent/device-voice-assistant] as AgentRouter
-    [device.py\nPOST /devices/online/:id\nPOST /devices/heartbeat/:id\nGET /devices/mine\nGET|PATCH /devices/config\nGET /devices/:id/status\nPOST /devices/:id/unpair\nGET /devices/:id/history] as DeviceRouter
+    [device.py\nPOST /devices/online/:id\nPOST /devices/heartbeat/:id\nGET /devices/mine\nGET|PATCH /devices/config\nGET /devices/:id/status\nPOST /devices/:id/unpair\nGET /devices/:id/history\n<size:10>in-memory rate-limit: 5 req / 60 s</size>] as DeviceRouter
     [notification.py\nGET /notifications\nDELETE /notifications/:id] as NotifRouter
   }
 
@@ -158,15 +158,19 @@ MemCtrl --> SessionsCol : chat history\n+ checkpoints
 
 ' Agent → DB / Vector
 CoreAgent --> SessionsCol : MongoDBSaver\ncheckpoint
-CoreAgent --> VectorCol : get_similar_documents()
+' NOTE: VectorDB (Milvus) integration exists in vector_db.py but is currently DEACTIVATED
+'       get_similar_documents() is commented out — no vector search in current agent.
+' CoreAgent ..> VectorCol : get_similar_documents()  [INACTIVE]
 
 ' Legacy endpoints wiring
-LegacyRoutes --> Sarvam : STT + TTS
-LegacyRoutes --> Gemini : LLM (legacy prompts)
+' NOTE: In main.py legacy routes — STT + Gemini LLM calls are commented out.
+' Only GET /test-audio-generator (TTS via SarvamAI) is fully active.
+LegacyRoutes --> Sarvam : TTS (active) / STT+LLM inactive
+' LegacyRoutes --> Gemini : LLM (legacy prompts)  [INACTIVE — commented out]
 
 ' External service calls
 LLM --> Gemini : inference
-VectorCol ..> EmbedAPI : embed query
+' VectorCol ..> EmbedAPI : embed query  [INACTIVE — vector search deactivated]
 AgentUtil --> Sarvam : TTS streaming
 AgentRouter --> Sarvam : STT (WAV → text)
 FirebaseUtil --> FirebaseAuth : verify_id_token()
@@ -203,8 +207,9 @@ note right
   · topic, lesson_plan[], lesson_step
   · awaiting_lesson_confirmation
   · pending_topic, feedback
-  · last_explanation, last_action
-  · session_id
+  · last_explanation  ← stores last AI message
+  ·   (used by repeat-request fast path)
+  · last_action, session_id
 end note
 
 :Load checkpoint from MongoDB\n(MongoDBSaver — thread_id = session_id);

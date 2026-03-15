@@ -1,0 +1,266 @@
+' ============================================================
+'  FUNCTIONAL ARCHITECTURE — vijayebhav_v2 (Neurosattva)
+'  High-level view: who uses what, what the system does,
+'  and how information flows — without implementation details.
+' ============================================================
+
+' ------------------------------------------------------------
+' DIAGRAM 1 — Who Uses the System & What They Can Do
+' ------------------------------------------------------------
+@startuml Functional_Overview
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 13
+skinparam packageStyle rectangle
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.5
+skinparam ActorBackgroundColor #EAF4FB
+skinparam ActorBorderColor #4A90D9
+
+title <b>Neurosattva — Functional Overview</b>\n<size:12>What users can do and what the system provides</size>
+
+'-------- USERS --------
+actor "Student\n(Mobile / Web)" as Student #EAF4FB
+actor "IoT Voice Device\n(ESP32 etc.)" as Device #FFF3E0
+
+'-------- CAPABILITIES --------
+package "Account & Identity" as Identity #FFF9C4 {
+  usecase "Register / Login\n(Email or Google)" as UC_Auth
+  usecase "Manage Profile\n(name, grade, board)" as UC_Profile
+}
+
+package "AI Tutor Conversations" as AITutor #E8F5E9 {
+  usecase "Ask a Quick Question\n→ get an instant answer" as UC_General
+  usecase "Learn a Topic in Depth\n→ step-by-step guided lesson" as UC_Lesson
+  usecase "Be Evaluated on Each Step\n→ feedback + move forward" as UC_Eval
+}
+
+package "Voice Assistant (Device)" as VoiceAssist #EDE7F6 {
+  usecase "Speak a Question\n→ receive spoken answer" as UC_Voice
+  usecase "Interrupt Anytime\n→ new question cancels previous" as UC_Interrupt
+  usecase "Multi-language Support\n→ query & response in local language" as UC_Lang
+}
+
+package "Conversation History" as ConvHistory #E3F2FD {
+  usecase "Browse Past Conversations\n& Sessions" as UC_ConvHistory
+  usecase "Continue Where You Left Off\n(persistent AI memory)" as UC_Memory
+}
+
+package "Device Management" as DevMgmt #FBE9E7 {
+  usecase "Pair a Voice Device\nto your Account" as UC_Pair
+  usecase "Configure Learning Style\n(Normal/Strict, Concise/Detailed,\nBeginner/Intermediate/Advanced)" as UC_Config
+  usecase "Transfer / Unpair Device" as UC_Unpair
+}
+
+package "Notifications" as Notifs #F3E5F5 {
+  usecase "Receive Alerts\n(device transfer warnings, etc.)" as UC_Notif
+}
+
+'-------- RELATIONSHIPS --------
+Student --> UC_Auth
+Student --> UC_Profile
+Student --> UC_General
+Student --> UC_Lesson
+Student --> UC_Eval
+Student --> UC_ConvHistory
+Student --> UC_Memory
+Student --> UC_Pair
+Student --> UC_Config
+Student --> UC_Unpair
+Student --> UC_Notif
+
+Device --> UC_Voice
+Device --> UC_Interrupt
+Device --> UC_Lang
+
+UC_Voice ..> UC_General : "spoken query\ntranscribed → AI response → spoken back"
+UC_Voice ..> UC_Lesson  : "guided lesson\ndelivered as voice"
+UC_Lesson ..> UC_Memory : "lesson state persisted\nacross sessions"
+
+@enduml
+
+
+' ------------------------------------------------------------
+' DIAGRAM 2 — End-to-End Functional Flow (Voice Assistant)
+' ------------------------------------------------------------
+@startuml Functional_Voice_Flow
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam ArrowColor #444444
+skinparam ArrowThickness 1.5
+skinparam NoteBackgroundColor #E8F4FD
+skinparam noteBorderColor #90CAF9
+skinparam SequenceBoxBorderColor #BBBBBB
+
+title <b>Voice Learning Session — End-to-End Functional Flow</b>\n<size:12>How a student's spoken question becomes a guided learning experience</size>
+
+actor "Voice Device\n(Student)" as S
+participant "Backend\nAPI" as API
+participant "Speech\nRecognition" as STT
+participant "AI Tutor\n(Guided Agent)" as AI
+participant "Text-to-Speech\n(Streaming)" as TTS
+
+S -> API : 🎤 Student speaks a question\n<i>(raw audio sent over WiFi)</i>
+API -> STT : Convert speech → text\n<i>detects language automatically</i>
+STT --> API : transcript + language
+
+note over API
+  A filler phrase ("Let me think...")
+  is returned immediately before
+  the AI finishes — so the device
+  isn't silent while processing.
+end note
+
+API -> AI : Text query + student profile\n+ session context (memory)
+note over AI
+  The AI remembers the full
+  conversation across sessions.
+  It knows the student's grade,
+  board, and learning progress.
+end note
+
+group AI Decision (invisible to student)
+  AI -> AI : Is this casual small talk?
+  note right : Handled instantly,\nno deep processing needed.
+  AI -> AI : Is this a simple factual question?
+  note right : Quick, direct answer.
+  AI -> AI : Is this a conceptual topic?
+  note right : Offer a structured lesson\nbroken into sub-topics.
+end
+
+AI --> API : Response text\n<i>(plain, symbol-free — designed for speech)</i>
+
+API -> TTS : Convert text → audio\n<i>sentence-by-sentence streaming</i>
+TTS --> S : 🔊 Audio streamed while still generating\n<i>first words play before full response is ready</i>
+
+note over S, TTS
+  If the student speaks again mid-stream,
+  the current audio is cancelled and
+  the new question is processed immediately.
+end note
+
+@enduml
+
+
+' ------------------------------------------------------------
+' DIAGRAM 3 — Guided Learning Journey (Student Experience)
+' ------------------------------------------------------------
+@startuml Functional_Learning_Journey
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam ArrowColor #444444
+skinparam ArrowThickness 1.5
+skinparam ActivityBorderColor #888888
+skinparam ActivityBackgroundColor #F5F5F5
+skinparam ActivityDiamondBackgroundColor #FFF9C4
+skinparam NoteBackgroundColor #E3F2FD
+skinparam noteBorderColor #90CAF9
+
+title <b>AI Guided Learning Journey</b>\n<size:12>How the AI Tutor takes a student from a question to mastery of a topic</size>
+
+start
+
+:Student asks a question;
+
+if (Casual greeting / small talk?) then (yes)
+  :AI responds warmly and briefly\n<i>e.g. "Hey! Ready to learn something today?"</i>;
+  stop
+else (no)
+endif
+
+if (Simple factual question?) then (yes)
+  :AI gives a clear, direct answer\n<i>e.g. "Water boils at 100°C."</i>;
+  stop
+else (needs explanation)
+endif
+
+:AI gives a <b>brief overview</b> of the topic\nthen asks: "Want me to teach this step by step?";
+
+if (Student says Yes) then (yes)
+  :AI creates a <b>Lesson Plan</b>\n→ breaks topic into 3–5 sub-topics;
+else (No / Ambiguous)
+  :AI returns to free Q&A mode;
+  stop
+endif
+
+repeat
+  :AI explains the <b>current sub-topic</b>\nthen asks a follow-up question;
+
+  :Student responds;
+
+  if (Wants to exit or change topic?) then (exit)
+    :AI acknowledges progress\n<i>"We covered X of Y sub-topics on [topic]..."</i>;
+    :Return to free Q&A mode;
+    stop
+  elseif (Repeat / didn't hear?) then (repeat)
+    :AI repeats last message;
+  elseif (Clarification question?) then (clarify)
+    :AI answers briefly, then\nre-asks the original question;
+  else (answers the question)
+    :AI evaluates the answer\n→ Correct: praise + move forward\n→ Incorrect: explain + move forward\n<i>(never loops — always advances)</i>;
+  endif
+repeat while (more sub-topics to cover?) is (yes)
+-> no (all done);
+
+:AI delivers a <b>lesson completion message</b>\n<i>"Great work! You've finished the lesson on [topic]."</i>;
+:Return to free Q&A mode;
+
+stop
+
+@enduml
+
+
+' ------------------------------------------------------------
+' DIAGRAM 4 — System Capabilities Map
+' ------------------------------------------------------------
+@startuml Functional_Capability_Map
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam packageStyle rectangle
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.5
+skinparam rectangleBackgroundColor #FAFAFA
+
+title <b>System Capabilities Map</b>\n<size:12>What each part of the platform does for students</size>
+
+rectangle "🔐  Identity & Security" as ID #FFF9C4 {
+  rectangle "Email signup & login\n(secure password hashing)" as R1
+  rectangle "Google Sign-In\n(OAuth via Firebase)" as R2
+  rectangle "Persistent sessions\n(JWT tokens valid 30 days)" as R3
+}
+
+rectangle "🤖  AI Tutor Engine" as AIE #E8F5E9 {
+  rectangle "Free Q&A Mode\nInstant answers to any question" as R4
+  rectangle "Guided Lesson Mode\nStep-by-step breakdown of complex topics" as R5
+  rectangle "Answer Evaluation\nFeedback after every lesson step" as R6
+  rectangle "Conversational Memory\nRembers past exchanges within a session" as R7
+  rectangle "Small Talk Handling\nCasual conversation without breaking focus" as R8
+}
+
+rectangle "🎙️  Voice Interface" as VI #EDE7F6 {
+  rectangle "Speech-to-Text\nUnderstands any Indian language" as R9
+  rectangle "Text-to-Speech\nStreaming audio response (low latency)" as R10
+  rectangle "Interruption Handling\nNew speech cancels current playback" as R11
+  rectangle "Multi-language Response\nReplies in student's detected language" as R12
+}
+
+rectangle "📚  Learning History" as LH #E3F2FD {
+  rectangle "Conversation Threads\nOrganised by topic" as R13
+  rectangle "Session Continuity\nPick up any conversation where it left off" as R14
+}
+
+rectangle "🔧  Device Management" as DM #FBE9E7 {
+  rectangle "Device Pairing\nLink a physical voice device to an account" as R15
+  rectangle "Learning Configuration\nAdjust difficulty, verbosity, and style" as R16
+  rectangle "Ownership Transfer\nSafely reassign a device to a new student" as R17
+  rectangle "Status Monitoring\nOnline / offline tracking" as R18
+}
+
+rectangle "🔔  Notifications" as NF #F3E5F5 {
+  rectangle "System Alerts\n(device transfers, warnings)" as R19
+}
+
+@enduml

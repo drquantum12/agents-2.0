@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-CHUNK_SIZE_BYTES = 50 * 1024
+CHUNK_SIZE_BYTES = 100 * 1024 # 100KB buffer for streaming to balance latency and possible network issues from hosted app on Cloud Run.
 # Smaller buffer for sentence-level TTS so first audio arrives faster
 SENTENCE_CHUNK_SIZE_BYTES = 8 * 1024
 
@@ -54,15 +54,15 @@ async def streaming_audio_response(
                     audio_chunk = base64.b64decode(message.data.audio)
                     audio_buffer.extend(audio_chunk)
                     
-                    # 2. Check if the buffer is big enough to start yielding 50KB chunks
+                    # 2. Check if the buffer is big enough to start yielding 100KB chunks
                     while len(audio_buffer) >= CHUNK_SIZE_BYTES:
-                        # Extract a 50KB chunk
+                        # Extract a 100KB chunk
                         chunk_to_yield = audio_buffer[:CHUNK_SIZE_BYTES]
                         
                         # Remove the yielded chunk from the buffer
                         del audio_buffer[:CHUNK_SIZE_BYTES]
                         
-                        # Yield the 50KB chunk to the client
+                        # Yield the 100KB chunk to the client
                         yield bytes(chunk_to_yield)
                         await asyncio.sleep(0.5)
                 

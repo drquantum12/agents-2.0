@@ -12,9 +12,13 @@ class UserBase(BaseModel):
     personalized_response: Optional[bool] = Field(default=False)
 
 
-class UserCreate(UserBase):
-    """Model for creating a new user"""
-    password: Optional[str] = Field(None, min_length=6)
+class UserRegister(BaseModel):
+    """Model for registering a new user via Firebase ID token"""
+    id_token: str
+    name: str = Field(..., min_length=1, max_length=100)
+    grade: Optional[str] = Field(None, max_length=20)
+    board: Optional[str] = Field(None, max_length=50)
+    personalized_response: Optional[bool] = Field(default=False)
 
 
 class UserUpdate(BaseModel):

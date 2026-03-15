@@ -38,14 +38,19 @@ No authentication required for these endpoints.
 ---
 
 ### POST `/auth/register`
-Register a new user with email and password.
+Register a new user. The Firebase account must already be created on the client
+(via `createUserWithEmailAndPassword`). This endpoint persists the user profile
+in the backend database.
+
+> **How to get the token:** After `createUserWithEmailAndPassword(auth, email, password)`
+> succeeds, call `user.getIdToken()` and include it as `id_token`.
+> Email is extracted server-side from the token — do **not** send the raw password.
 
 **Request Body:**
 ```json
 {
+  "id_token": "<firebase_id_token>",
   "name": "Jane Doe",
-  "email": "jane@example.com",
-  "password": "secret123",
   "grade": "10",
   "board": "CBSE",
   "personalized_response": false
@@ -54,9 +59,8 @@ Register a new user with email and password.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
+| `id_token` | string | Yes | Firebase ID token from `createUserWithEmailAndPassword` → `user.getIdToken()` |
 | `name` | string | Yes | 1–100 chars |
-| `email` | string (email) | Yes | |
-| `password` | string | No | Min 6 chars |
 | `grade` | string | No | Max 20 chars |
 | `board` | string | No | Max 50 chars |
 | `personalized_response` | boolean | No | Default: `false` |
@@ -78,20 +82,29 @@ Register a new user with email and password.
 }
 ```
 
-**Errors:** `400` Email already registered
+**Errors:** `400` Email already registered · `400` Token missing email claim · `401` Invalid/expired Firebase token
 
 ---
 
 ### POST `/auth/login`
-Login with email and password.
+Login with email and password using a Firebase ID token.
+
+> **Note:** The backend no longer accepts a raw email + password. After calling
+> `signInWithEmailAndPassword(email, password)` (or after a password reset),
+> call `user.getIdToken()` on the Firebase user object and send that token here.
+> This keeps Firebase as the single source of truth for credentials and ensures
+> password resets work correctly.
 
 **Request Body:**
 ```json
 {
-  "email": "jane@example.com",
-  "password": "secret123"
+  "id_token": "<firebase_id_token>"
 }
 ```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id_token` | string | Yes | Firebase ID token from `signInWithEmailAndPassword` → `user.getIdToken()` |
 
 **Response `200`:**
 ```json
@@ -102,7 +115,7 @@ Login with email and password.
 }
 ```
 
-**Errors:** `401` Invalid credentials
+**Errors:** `400` Token missing email claim · `401` Invalid/expired Firebase token · `401` No account found for this email
 
 ---
 

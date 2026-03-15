@@ -1,9 +1,9 @@
-from .user import User, UserCreate, UserUpdate, UserInDB
+from .user import User, UserRegister, UserUpdate, UserInDB
 from .conversation import Conversation, ConversationCreate, ConversationUpdate, ConversationInDB
 
 __all__ = [
     "User",
-    "UserCreate",
+    "UserRegister",
     "UserUpdate",
     "UserInDB",
     "Conversation",
