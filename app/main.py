@@ -63,87 +63,11 @@ app.include_router(device.router, prefix="/api/v1")
 
 client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 
+# Import the pre-buffer + frame-aligned streaming implementation from agents
+from app.agents.utility import streaming_audio_response
 
-async def streaming_audio_response(
-    text: str, language_code: str = "en-IN"
-) -> AsyncGenerator[bytes, None]:
-    client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-    
-    # Ensure output directory exists
-    output_dir = os.path.join(os.path.dirname(__file__), "data")
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "output.mp3")
-    
-    # Open file in async-safe way (sync I/O is fine here because chunks are small)
-    try:
-        async with client.text_to_speech_streaming.connect(model="bulbul:v2", send_completion_event=True) as ws:
-            await ws.configure(target_language_code=language_code, speaker="anushka")
-            
-            # Send text and flush once
-            await ws.convert(text)
-            await ws.flush()
+# Legacy local copy removed — single source of truth is app.agents.utility
 
-            # Stream chunks as they come
-            with open(output_path, "wb") as output_file:
-                async for message in ws:
-                    if isinstance(message, AudioOutput):
-                        audio_chunk = base64.b64decode(message.data.audio)
-                        
-                        # Write to file immediately
-                        output_file.write(audio_chunk)
-                        output_file.flush()
-                        
-                        # Yield to client immediately
-                        yield audio_chunk
-                        await asyncio.sleep(0.5)
-                    
-                    elif isinstance(message, EventResponse):
-                        if message.data.event_type == "final":
-                            break
-
-            # async for message in ws:
-            #     if isinstance(message, AudioOutput):
-            #         audio_chunk = base64.b64decode(message.data.audio)
-                    
-            #         # Yield to client immediately
-            #         yield audio_chunk
-            #         await asyncio.sleep(0.5)
-                
-            #     elif isinstance(message, EventResponse):
-            #         if message.data.event_type == "final":
-            #             break
-
-    except Exception as e:
-        logger.error(f"Error during audio streaming and saving: {e}")
-        raise
-
-# async def streaming_audio_response(text: str, language_code: str = "en-IN") -> AsyncGenerator[bytes, None]:
-#     with open("data/output_v2.mp3", "wb") as output_file:
-#         try:
-#             # Initialize Async Client inside the async function
-#             client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-            
-#             async with client.text_to_speech_streaming.connect(model="bulbul:v2") as ws:
-#                 await ws.configure(target_language_code=language_code, speaker="anushka")
-#                 await ws.convert(text)
-#                 await ws.flush()
-
-#                 async for message in ws:
-#                     if isinstance(message, AudioOutput):
-#                         # Decode the base64 chunk
-#                         audio_chunk = base64.b64decode(message.data.audio)
-                        
-#                         # Write chunk to file
-#                         output_file.write(audio_chunk)
-#                         output_file.flush()
-                        
-#                         # Yield chunk for streaming
-#                         yield audio_chunk
-
-#         except Exception as e:
-#             logger.error(f"Error during audio streaming and saving: {e}")
-#             # Re-raise the exception for FastAPI to handle
-#             raise
 
 @app.get("/test-audio-generator")
 async def test_audio_generator():
@@ -308,9 +232,19 @@ async def voice_assistant(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error in /voice-assistant endpoint: {e}")
         return {"error": str(e)}
-    
+
 @app.get("/testing-audio-stream")
-async def test_tts_stream():
+async def test_tts_stream(request: Request):
+    """
+    Tests the streaming functionality by reading the last saved output.mp3 file.
+    """
+    return StreamingResponse(
+        test_audio_stream(),
+        media_type="audio/mpeg"
+    )    
+
+@app.post("/testing-audio-stream")
+async def test_tts_stream(request: Request):
     """
     Tests the streaming functionality by reading the last saved output.mp3 file.
     """

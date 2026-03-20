@@ -4,176 +4,167 @@ import logging
 from typing import AsyncGenerator
 import os
 import asyncio
-import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-CHUNK_SIZE_BYTES = 100 * 1024 # 100KB buffer for streaming to balance latency and possible network issues from hosted app on Cloud Run.
-# Smaller buffer for sentence-level TTS so first audio arrives faster
-SENTENCE_CHUNK_SIZE_BYTES = 8 * 1024
+
+# ---------------------------------------------------------------------------
+# Audio streaming tuning constants
+# ---------------------------------------------------------------------------
+# Accumulate this much audio before yielding the FIRST chunk.  This gives the
+# client device a comfortable playback head-start (~5-8 s at 128 kbps) so it
+# can absorb later network / generation jitter — the same reason file-based
+# streaming sounds smooth.
+INITIAL_BUFFER_BYTES = 100 * 1024   # 100 KB
+
+# After the initial burst, yield in smaller pieces to keep memory low while
+# still delivering complete MP3 frames.
+STREAM_CHUNK_BYTES = 24 * 1024      # 24 KB
+# ---------------------------------------------------------------------------
 
 client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 
+
+# ---------------------------------------------------------------------------
+# MP3 frame helpers – ensure we never split a chunk mid-frame
+# ---------------------------------------------------------------------------
+# Bitrates in kbps indexed by (mpeg_version_bits, layer_bits, bitrate_index).
+# Only the combinations used by common TTS output are listed.
+_BITRATES = {
+    # MPEG-1
+    (3, 1): [0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0],   # Layer III
+    (3, 2): [0,32,48,56,64,80,96,112,128,160,192,224,256,320,384,0],   # Layer II
+    (3, 3): [0,32,64,96,128,160,192,224,256,288,320,352,384,416,448,0], # Layer I
+    # MPEG-2 / 2.5  (Layer III & II share the same row)
+    (2, 1): [0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0],
+    (2, 2): [0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0],
+    (2, 3): [0,32,48,56,64,80,96,112,128,144,160,176,192,224,256,0],
+    (0, 1): [0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0],
+    (0, 2): [0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0],
+    (0, 3): [0,32,48,56,64,80,96,112,128,144,160,176,192,224,256,0],
+}
+
+_SAMPLE_RATES = {
+    3: [44100, 48000, 32000],   # MPEG-1
+    2: [22050, 24000, 16000],   # MPEG-2
+    0: [11025, 12000,  8000],   # MPEG-2.5
+}
+
+
+def _mp3_frame_length(data: bytes, offset: int) -> int | None:
+    """Return the byte-length of the MP3 frame starting at *offset*, or None."""
+    if offset + 4 > len(data):
+        return None
+    b0, b1, b2 = data[offset], data[offset + 1], data[offset + 2]
+    if b0 != 0xFF or (b1 & 0xE0) != 0xE0:
+        return None
+
+    ver   = (b1 >> 3) & 0x03          # 0=2.5, 2=V2, 3=V1
+    layer = (b1 >> 1) & 0x03          # 1=III, 2=II, 3=I
+    br_i  = (b2 >> 4) & 0x0F
+    sr_i  = (b2 >> 2) & 0x03
+    pad   = (b2 >> 1) & 0x01
+
+    if ver == 1 or layer == 0 or br_i == 0 or br_i == 15 or sr_i == 3:
+        return None
+    row = _BITRATES.get((ver, layer))
+    sr_row = _SAMPLE_RATES.get(ver)
+    if row is None or sr_row is None:
+        return None
+
+    bitrate = row[br_i] * 1000
+    sr = sr_row[sr_i]
+    if layer == 3:                           # Layer I
+        return (12 * bitrate // sr + pad) * 4
+    spf = 1152 if ver == 3 else 576          # samples per frame
+    return spf * bitrate // (8 * sr) + pad
+
+
+def _frame_aligned_split(buf: bytearray, target: int) -> int:
+    """Return the largest offset <= *target* that falls on an MP3 frame boundary.
+
+    Walks complete frames from the start of *buf*.  If no valid frame is found
+    the function falls back to *target* (best-effort).
+    """
+    pos = 0
+    last_boundary = 0
+    while pos < len(buf) - 3 and pos < target:
+        flen = _mp3_frame_length(buf, pos)
+        if flen and flen > 0 and pos + flen <= len(buf):
+            pos += flen
+            last_boundary = pos
+            if pos >= target:
+                return pos          # exact or just past target — still frame-aligned
+        else:
+            pos += 1                # skip non-sync byte
+    return last_boundary or target  # fallback keeps streaming moving
+
+
+# ---------------------------------------------------------------------------
+# Core TTS streaming generator
+# ---------------------------------------------------------------------------
 async def streaming_audio_response(
     text: str, language_code: str = "en-IN"
 ) -> AsyncGenerator[bytes, None]:
-    client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-    
-    audio_buffer = bytearray()
-    # Open file in async-safe way (sync I/O is fine here because chunks are small)
-    try:
-        async with client.text_to_speech_streaming.connect(model="bulbul:v2", send_completion_event=True) as ws:
-            await ws.configure(target_language_code=language_code, speaker="anushka")
-            
-            # Send text and flush once
-            await ws.convert(text)
-            await ws.flush()
+    """Stream MP3 audio from Sarvam TTS with smooth playback.
 
-            # Stream chunks as they come
-            # with open("data/output.mp3", "wb") as output_file:
-            #     async for message in ws:
-            #         if isinstance(message, AudioOutput):
-            #             audio_chunk = base64.b64decode(message.data.audio)
-                        
-            #             # Write to file immediately
-            #             output_file.write(audio_chunk)
-            #             output_file.flush()
-                        
-            #             # Yield to client immediately
-            #             yield audio_chunk
-            #             await asyncio.sleep(0.5)
-                    
-            #         elif isinstance(message, EventResponse):
-            #             if message.data.event_type == "final":
-            #                 break
-
-            async for message in ws:
-                if isinstance(message, AudioOutput):
-                    audio_chunk = base64.b64decode(message.data.audio)
-                    audio_buffer.extend(audio_chunk)
-                    
-                    # 2. Check if the buffer is big enough to start yielding 100KB chunks
-                    while len(audio_buffer) >= CHUNK_SIZE_BYTES:
-                        # Extract a 100KB chunk
-                        chunk_to_yield = audio_buffer[:CHUNK_SIZE_BYTES]
-                        
-                        # Remove the yielded chunk from the buffer
-                        del audio_buffer[:CHUNK_SIZE_BYTES]
-                        
-                        # Yield the 100KB chunk to the client
-                        yield bytes(chunk_to_yield)
-                        await asyncio.sleep(0.5)
-                
-                elif isinstance(message, EventResponse):
-                    if message.data.event_type == "final":
-                        break
-            
-            # Yield any remaining audio in the buffer
-            if audio_buffer:
-                yield bytes(audio_buffer)
-
-    except Exception as e:
-        logger.error(f"Error during audio streaming and saving: {e}")
-        raise
-
-
-def split_into_sentences(text: str) -> list[str]:
-    """
-    Split text into sentences using regex-based boundary detection.
-    Handles common abbreviations and edge cases for TTS pipelining.
-    Each returned sentence is non-empty and stripped.
-    """
-    # Split on sentence-ending punctuation followed by whitespace or end-of-string.
-    # Preserves the delimiter with the preceding sentence.
-    raw_parts = re.split(r'(?<=[.!?])\s+', text.strip())
-
-    sentences = []
-    for part in raw_parts:
-        part = part.strip()
-        if part:
-            sentences.append(part)
-
-    # If no sentence-ending punctuation was found (single chunk), return as-is
-    if not sentences:
-        sentences = [text.strip()]
-
-    return sentences
-
-
-async def tts_sentence(
-    sentence: str,
-    language_code: str = "en-IN",
-) -> AsyncGenerator[bytes, None]:
-    """
-    Convert a single sentence to audio with minimal buffering.
-    Uses a smaller buffer (8KB) so the first audio bytes arrive quickly.
-    For sentence-level pipelining, low latency to first byte matters more than large chunks.
+    Strategy
+    --------
+    1. **Initial pre-buffer** – accumulate >= INITIAL_BUFFER_BYTES before
+       yielding the first chunk.  This gives the receiving device enough audio
+       runway (~5-8 s) to absorb later jitter — exactly why file-based
+       streaming already sounds smooth.
+    2. **Frame-aligned splitting** – every chunk boundary is placed on an MP3
+       frame edge so the decoder never sees a partial frame (which causes
+       clicks / pops).
+    3. **Remainder flush** – anything left after the TTS stream ends is
+       yielded immediately.
     """
     tts_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
+
     audio_buffer = bytearray()
+    initial_yielded = False
 
     try:
         async with tts_client.text_to_speech_streaming.connect(
             model="bulbul:v2", send_completion_event=True
         ) as ws:
             await ws.configure(target_language_code=language_code, speaker="anushka")
-            await ws.convert(sentence)
+            await ws.convert(text)
             await ws.flush()
 
             async for message in ws:
                 if isinstance(message, AudioOutput):
-                    audio_chunk = base64.b64decode(message.data.audio)
-                    audio_buffer.extend(audio_chunk)
+                    audio_buffer.extend(base64.b64decode(message.data.audio))
 
-                    # Yield in small chunks for faster first-byte delivery
-                    while len(audio_buffer) >= SENTENCE_CHUNK_SIZE_BYTES:
-                        chunk_to_yield = audio_buffer[:SENTENCE_CHUNK_SIZE_BYTES]
-                        del audio_buffer[:SENTENCE_CHUNK_SIZE_BYTES]
-                        yield bytes(chunk_to_yield)
+                    if not initial_yielded:
+                        # ---- Phase 1: fill the pre-buffer ----
+                        if len(audio_buffer) >= INITIAL_BUFFER_BYTES:
+                            split = _frame_aligned_split(audio_buffer, INITIAL_BUFFER_BYTES)
+                            yield bytes(audio_buffer[:split])
+                            del audio_buffer[:split]
+                            initial_yielded = True
+                    else:
+                        # ---- Phase 2: stream in smaller frame-aligned chunks ----
+                        while len(audio_buffer) >= STREAM_CHUNK_BYTES:
+                            split = _frame_aligned_split(audio_buffer, STREAM_CHUNK_BYTES)
+                            yield bytes(audio_buffer[:split])
+                            del audio_buffer[:split]
 
                 elif isinstance(message, EventResponse):
                     if message.data.event_type == "final":
                         break
 
-            # Yield remaining audio for this sentence
+            # Flush whatever remains (could be the entire audio for short texts)
             if audio_buffer:
                 yield bytes(audio_buffer)
 
     except Exception as e:
-        logger.error(f"Error in sentence TTS for '{sentence[:40]}...': {e}")
+        logger.error(f"Error during audio streaming: {e}")
         raise
 
-
-async def sentence_pipelined_tts(
-    text: str,
-    language_code: str = "en-IN",
-) -> AsyncGenerator[bytes, None]:
-    """
-    Sentence-level TTS pipelining: split text into sentences and convert each
-    to audio sequentially with minimal buffering.
-
-    Why this is faster:
-    - TTS for a ~15-word sentence produces first audio in ~0.3-0.5s
-    - TTS for a full ~100-word response takes ~2-3s to first audio
-    - Client starts playing audio from sentence 1 while sentences 2+ are being converted
-
-    Falls back to full-text streaming_audio_response if only 1 sentence.
-    """
-    sentences = split_into_sentences(text)
-    logger.info(f"Sentence pipelining: {len(sentences)} sentence(s) to convert")
-
-    if len(sentences) <= 1:
-        # Single sentence — use original function (no overhead from splitting)
-        async for chunk in streaming_audio_response(text, language_code):
-            yield chunk
-        return
-
-    for i, sentence in enumerate(sentences):
-        logger.info(f"TTS sentence {i + 1}/{len(sentences)}: '{sentence[:50]}...'")
-        async for chunk in tts_sentence(sentence, language_code):
-            yield chunk
 
 def chunk_text(text, max_length=2000):
     """Splits text into chunks of at most max_length characters while preserving word boundaries."""
