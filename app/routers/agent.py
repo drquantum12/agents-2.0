@@ -2,13 +2,12 @@ import asyncio
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from app.agents.core_agent import run_agent, pick_filler_phrase
+from app.agents.core_agent import run_agent
 from app.utility.security import get_current_user
 from app.models.user import User
 import tempfile
-from app.agents.utility import client, translate_text, streaming_audio_response, generate_filler_audio
+from app.agents.utility import client, translate_text, generate_full_audio
 from app.agents.agent_memory_controller import get_or_create_device_session_id
-from typing import AsyncGenerator
 import os
 import logging
 
@@ -37,20 +36,10 @@ UNSUPPORTED_LANGUAGE_MESSAGE = (
     "English, Hindi, Bengali, Gujarati, Kannada, Malayalam, Marathi, Odia, Punjabi, Tamil, or Telugu."
 )
 
+STREAM_CHUNK_SIZE = 32 * 1024  # 32 KB chunks for streaming
+
 # Tracks the active cancellation event per user so a new request can interrupt the current stream.
 _active_cancel_events: dict[str, asyncio.Event] = {}
-
-
-async def _cancellable_stream(
-    generator: AsyncGenerator[bytes, None],
-    cancel_event: asyncio.Event,
-) -> AsyncGenerator[bytes, None]:
-    """Wraps an async byte generator and stops yielding once cancel_event is set."""
-    async for chunk in generator:
-        if cancel_event.is_set():
-            logger.info("Stream cancelled — new request preempted this one.")
-            break
-        yield chunk
 
 
 class QueryRequest(BaseModel):
@@ -66,35 +55,31 @@ async def agent(request: QueryRequest, user: User = Depends(get_current_user)):
 async def device_voice_assistant(request: Request,
                                   user: User = Depends(get_current_user)
                                   ):
+    # 1. Receive user audio
     wav_data = await request.body()
 
-    # with open("app/data/input_32bit.wav", "wb") as f:
-    #         f.write(wav_data)
-    
+    # 2. Speech-to-text + language detection
     with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as temp_audio:
-            temp_audio.write(wav_data)
-            temp_audio.flush()
-            result = client.speech_to_text.translate(
+        temp_audio.write(wav_data)
+        temp_audio.flush()
+        result = client.speech_to_text.translate(
             file=temp_audio,
             model="saaras:v2.5"
         )
-    
-    session_id = get_or_create_device_session_id(user_id=user["_id"])
+
     language_code = result.language_code if result.language_code else ""
 
-    # --- Unsupported / unrecognised language guard ---
+    # Unsupported / unrecognised language guard
     if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
-        logger.warning(f"Unsupported or unrecognised language code: '{language_code}' — returning error audio")
-        error_audio = await generate_filler_audio(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN")
+        logger.warning(f"Unsupported or unrecognised language code: '{language_code}'")
+        error_audio = await generate_full_audio(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN")
         return StreamingResponse(
             iter([error_audio]),
             media_type="audio/mpeg",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
-    # -------------------------------------------------
 
     # --- Interruption logic ---
-    # Cancel any in-flight stream for this user before starting a new one.
     user_id = str(user["_id"])
     previous_event = _active_cancel_events.get(user_id)
     if previous_event:
@@ -104,10 +89,11 @@ async def device_voice_assistant(request: Request,
     _active_cancel_events[user_id] = cancel_event
     # --------------------------
 
-    agent_task = asyncio.create_task(asyncio.to_thread(run_agent, user=user, query=result.transcript, session_id=session_id))
+    # 3. Get LLM response
+    session_id = get_or_create_device_session_id(user_id=user["_id"])
+    response = await asyncio.to_thread(run_agent, user=user, query=result.transcript, session_id=session_id)
 
-    response = await agent_task
-
+    # 4. Translate back to detected language
     if language_code != "en-IN":
         response = await asyncio.to_thread(
             translate_text, response,
@@ -115,14 +101,24 @@ async def device_voice_assistant(request: Request,
             language_code,
         )
 
-    headers = {
+    # 5. Generate full TTS audio at once
+    audio_bytes = await generate_full_audio(response, language_code=language_code)
+
+    # 6. Stream audio chunks back (cancellable)
+    async def audio_chunk_generator():
+        for i in range(0, len(audio_bytes), STREAM_CHUNK_SIZE):
+            if cancel_event.is_set():
+                logger.info("Stream cancelled — new request preempted this one.")
+                break
+            yield audio_bytes[i:i + STREAM_CHUNK_SIZE]
+
+    return StreamingResponse(
+        audio_chunk_generator(),
+        media_type="audio/mpeg",
+        headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    
-    return StreamingResponse(
-        _cancellable_stream(streaming_audio_response(response, language_code=language_code), cancel_event),
-        media_type="audio/mpeg",
-        headers=headers
+            "X-Accel-Buffering": "no",
+            "Content-Length": str(len(audio_bytes)),
+        },
     )
