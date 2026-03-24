@@ -4,23 +4,22 @@ import logging
 from typing import AsyncGenerator
 import os
 import asyncio
+from app.state import state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-
-client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
+CHUNK_SIZE_BYTES = 32 * 1024  # 32 KB
 
 
 async def streaming_audio_response(
     text: str, language_code: str = "en-IN"
 ) -> AsyncGenerator[bytes, None]:
     """Stream MP3 audio from Sarvam TTS, yielding each chunk as-is from the API."""
-    tts_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
 
+    audio_buffer = bytearray()
     try:
-        async with tts_client.text_to_speech_streaming.connect(
+        async with state.async_sarvam_client.text_to_speech_streaming.connect(
             model="bulbul:v2", send_completion_event=True
         ) as ws:
             await ws.configure(target_language_code=language_code, speaker="anushka")
@@ -29,9 +28,16 @@ async def streaming_audio_response(
 
             async for message in ws:
                 if isinstance(message, AudioOutput):
-                    yield base64.b64decode(message.data.audio)
+                    audio_chunk = base64.b64decode(message.data.audio)
+                    audio_buffer.extend(audio_chunk)
+                    # yield chunk
+                    if len(audio_buffer) >= CHUNK_SIZE_BYTES:
+                        yield bytes(audio_buffer)
+                        audio_buffer.clear()
                 elif isinstance(message, EventResponse):
                     if message.data.event_type == "final":
+                        if audio_buffer:
+                            yield bytes(audio_buffer)
                         break
 
     except Exception as e:
@@ -56,7 +62,7 @@ def translate_text(text, source_language_code="hi-IN", target_language_code="en-
     text_chunks = chunk_text(text, max_length=2000)
     translated_texts = []
     for idx, chunk in enumerate(text_chunks):
-        response = client.text.translate(
+        response = state.sarvam_client.text.translate(
             input=chunk,
             source_language_code=source_language_code,
             target_language_code=target_language_code,
@@ -67,24 +73,3 @@ def translate_text(text, source_language_code="hi-IN", target_language_code="en-
         )
         translated_texts.append(response.translated_text)
     return " ".join(translated_texts)
-
-
-async def generate_full_audio(text: str, language_code: str = "en-IN") -> bytes:
-    """Generate complete TTS audio for the given text. Returns all audio bytes at once."""
-    tts_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-    audio_bytes = bytearray()
-    try:
-        async with tts_client.text_to_speech_streaming.connect(model="bulbul:v2", send_completion_event=True) as ws:
-            await ws.configure(target_language_code=language_code, speaker="anushka")
-            await ws.convert(text)
-            await ws.flush()
-            async for message in ws:
-                if isinstance(message, AudioOutput):
-                    audio_bytes.extend(base64.b64decode(message.data.audio))
-                elif isinstance(message, EventResponse):
-                    if message.data.event_type == "final":
-                        break
-    except Exception as e:
-        logger.error(f"Error generating audio: {e}")
-        raise
-    return bytes(audio_bytes)

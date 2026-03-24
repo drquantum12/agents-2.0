@@ -6,10 +6,12 @@ from app.agents.core_agent import run_agent
 from app.utility.security import get_current_user
 from app.models.user import User
 import tempfile
-from app.agents.utility import client, translate_text, generate_full_audio
+from app.agents.utility import translate_text, streaming_audio_response
 from app.agents.agent_memory_controller import get_or_create_device_session_id
 import os
+from typing import AsyncGenerator
 import logging
+from app.state import state
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["Agent"])
@@ -42,6 +44,18 @@ STREAM_CHUNK_SIZE = 32 * 1024  # 32 KB chunks for streaming
 _active_cancel_events: dict[str, asyncio.Event] = {}
 
 
+async def _cancellable_stream(
+    generator: AsyncGenerator[bytes, None],
+    cancel_event: asyncio.Event,
+) -> AsyncGenerator[bytes, None]:
+    """Wraps an async byte generator and stops yielding once cancel_event is set."""
+    async for chunk in generator:
+        if cancel_event.is_set():
+            logger.info("Stream cancelled — new request preempted this one.")
+            break
+        yield chunk
+
+
 class QueryRequest(BaseModel):
     query: str
         
@@ -55,14 +69,23 @@ async def agent(request: QueryRequest, user: User = Depends(get_current_user)):
 async def device_voice_assistant(request: Request,
                                   user: User = Depends(get_current_user)
                                   ):
+    
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    }
     # 1. Receive user audio
     wav_data = await request.body()
+
+    # with open("app/data/input_32bit.wav", "wb") as f:
+    #         f.write(wav_data)
 
     # 2. Speech-to-text + language detection
     with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as temp_audio:
         temp_audio.write(wav_data)
         temp_audio.flush()
-        result = client.speech_to_text.translate(
+        result = state.sarvam_client.speech_to_text.translate(
             file=temp_audio,
             model="saaras:v2.5"
         )
@@ -72,11 +95,10 @@ async def device_voice_assistant(request: Request,
     # Unsupported / unrecognised language guard
     if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
         logger.warning(f"Unsupported or unrecognised language code: '{language_code}'")
-        error_audio = await generate_full_audio(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN")
         return StreamingResponse(
-            iter([error_audio]),
+            streaming_audio_response(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN"),
             media_type="audio/mpeg",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            headers=headers,
         )
 
     # --- Interruption logic ---
@@ -101,24 +123,8 @@ async def device_voice_assistant(request: Request,
             language_code,
         )
 
-    # 5. Generate full TTS audio at once
-    audio_bytes = await generate_full_audio(response, language_code=language_code)
-
-    # 6. Stream audio chunks back (cancellable)
-    async def audio_chunk_generator():
-        for i in range(0, len(audio_bytes), STREAM_CHUNK_SIZE):
-            if cancel_event.is_set():
-                logger.info("Stream cancelled — new request preempted this one.")
-                break
-            yield audio_bytes[i:i + STREAM_CHUNK_SIZE]
-
     return StreamingResponse(
-        audio_chunk_generator(),
+        _cancellable_stream(streaming_audio_response(response, language_code=language_code), cancel_event),
         media_type="audio/mpeg",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Content-Length": str(len(audio_bytes)),
-        },
+        headers=headers,
     )

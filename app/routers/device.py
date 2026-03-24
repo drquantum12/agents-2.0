@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends, Request, HTTPException, Response
+import os
+import tempfile
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, HTTPException, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta, timezone
@@ -13,7 +16,8 @@ from app.controllers.device_controller import (
 )
 from app.schemas.device_schemas import DeviceOnlineRequest
 from app.db_utility.mongo_db import mongo_db
-
+from app.state import state
+from google.cloud import storage
 
 class DeviceConfigResponse(BaseModel):
     id: str
@@ -314,6 +318,14 @@ async def unpair_device(
         }},
     )
 
+    # send unpair notification to device via MQTT
+    topic = f"devices/{device_id}/commands"
+    message = "unpair"
+    try:
+        state.mqtt_client.publish(topic, message, qos=1)
+    except Exception:
+        pass  # Log error if needed, but don't fail the unpairing process
+
     return {"success": True}
 
 
@@ -339,3 +351,50 @@ async def get_device_history(
         "device_id": device_id,
         "ownership_history": device.get("ownership_history", []),
     }
+
+# endpoint to return latest firmware binary from google cloud storage as octet-stream for the device to download and update itself
+@router.get("/firmware/download")
+async def download_firmware(background_tasks: BackgroundTasks):
+    """
+    Returns the latest firmware binary from Google Cloud Storage.
+    The device can call this endpoint to download the firmware for updates.
+    """
+    bucket_name = "vijayebhav-firmware"
+
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        latest_firmware_version = mongo_db["firmware"].find_one(
+            sort=[("version", -1)],
+            projection={"version": 1},
+        )
+        if not latest_firmware_version:
+            raise HTTPException(status_code=404, detail="No firmware versions found")
+
+        blob_name = f"firmware_v{latest_firmware_version['version']}.bin"
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            raise HTTPException(status_code=404, detail="Firmware not found")
+
+        # Download to a temp file so FileResponse can handle Content-Length automatically
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+        try:
+            blob.download_to_file(tmp)
+            tmp.close()
+        except Exception:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise
+
+        # Clean up the temp file after the response is fully sent
+        background_tasks.add_task(os.unlink, tmp.name)
+
+        return FileResponse(
+            path=tmp.name,
+            media_type="application/octet-stream",
+            filename=blob_name,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error downloading firmware: {str(e)}")

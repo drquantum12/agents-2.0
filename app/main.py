@@ -1,18 +1,19 @@
-import os, wave
+import os
 import asyncio
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi import status
 from fastapi.middleware import cors as middleware
 import tempfile
-from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
-import base64
+from sarvamai import SarvamAI, AsyncSarvamAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
 from app.agents.prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
+from app.state import state
+from app.utility.hiveMQ import HiveMQClient
 # from db_utility.vector_db import VectorDB 
-import logging, uvicorn
-from typing import AsyncGenerator, Callable
+import logging
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,22 +25,26 @@ BIT_DEPTH = 32
 # --- Initialization (Assuming classes like VectorDB, AI_TUTOR_PROMPT are defined elsewhere) ---
 llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-flash-lite",
-            temperature=1,
+            temperature=0.6,
             max_output_tokens=8192,
             timeout=30,
             max_retries=2,)
 
-# Initialize with placeholder instances since actual imports are missing
-# try:
-#     vector_db = VectorDB()
-# except NameError:
-#     class DummyVectorDB:
-#         def get_similar_documents(self, query, top_k):
-#             return "Sample context for the query.", ["doc1"]
-#     vector_db = DummyVectorDB()
-#     logger.warning("Using DummyVectorDB as VectorDB class definition was not found.")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    state.async_sarvam_client = AsyncSarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
+    state.sarvam_client = SarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
+    state.mqtt_client = HiveMQClient()
+    try:
+        await state.mqtt_client.connect()
+    except Exception as e:
+        logger.error(f"HiveMQ connection failed: {e}")
+    yield
+    state.async_sarvam_client = None
+    state.sarvam_client = None
+    await state.mqtt_client.disconnect()
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
@@ -52,7 +57,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.routers import auth, user, conversation, message, agent, device, notification
+from app.routers import auth, user, conversation, message, agent, device, notification, mqtt
+
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(user.router, prefix="/api/v1")
 app.include_router(conversation.router, prefix="/api/v1")
@@ -60,6 +66,8 @@ app.include_router(message.router, prefix="/api/v1")
 app.include_router(agent.router, prefix="/api/v1")
 app.include_router(notification.router, prefix="/api/v1")
 app.include_router(device.router, prefix="/api/v1")
+app.include_router(mqtt.router, prefix="/api/v1")
+
 
 client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 
