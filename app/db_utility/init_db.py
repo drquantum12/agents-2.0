@@ -49,12 +49,31 @@ def initialize_database():
     
     print("✓ Messages collection indexes created")
     
+    # ===== DEVICES COLLECTION =====
+    devices_collection = db["devices"]
+
+    # Query devices by owner
+    devices_collection.create_index([("owner_user_id", ASCENDING)])
+    # Efficient active-device queries
+    devices_collection.create_index([("owner_user_id", ASCENDING), ("ownership_status", ASCENDING)])
+    # TTL index — auto-expire documents whose pending_transfer.expires_at has passed
+    devices_collection.create_index(
+        [("pending_transfer.expires_at", ASCENDING)],
+        expireAfterSeconds=0,
+        sparse=True,
+    )
+    # Admin / monitoring queries
+    devices_collection.create_index([("ownership_status", ASCENDING)])
+    devices_collection.create_index([("last_seen_at", DESCENDING)])
+
+    print("✓ Devices collection indexes created")
+    
     # Print collection statistics
     print("\n" + "="*50)
     print("Database Statistics:")
     print("="*50)
     
-    for collection_name in ["users", "conversations", "messages"]:
+    for collection_name in ["users", "conversations", "messages", "devices"]:
         collection = db[collection_name]
         count = collection.count_documents({})
         indexes = list(collection.list_indexes())

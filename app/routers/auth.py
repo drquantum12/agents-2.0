@@ -3,7 +3,7 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional
 
 from app.controllers.auth_controller import AuthController
-from app.models.user import UserCreate
+from app.models.user import UserRegister
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -12,8 +12,7 @@ auth_controller = AuthController()
 
 # Request/Response Models
 class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
+    id_token: str
 
 class GoogleAuth(BaseModel):
     id_token: str
@@ -35,14 +34,14 @@ class AuthResponse(BaseModel):
 # Endpoints
 
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate):
-    """Register a new user with email and password"""
+async def register(user_data: UserRegister):
+    """Register a new user via Firebase ID token"""
     return await auth_controller.register_user(user_data)
 
 @router.post("/login", response_model=AuthResponse)
 async def login(login_data: UserLogin):
-    """Login with email and password"""
-    return await auth_controller.login_user(login_data.email, login_data.password)
+    """Login with email and password via Firebase ID token"""
+    return await auth_controller.login_user(login_data.id_token)
 
 @router.post("/google", response_model=AuthResponse)
 async def google_auth(auth_data: GoogleAuth):

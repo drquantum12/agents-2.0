@@ -1,18 +1,19 @@
-import os, wave
+import os
 import asyncio
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi import status
 from fastapi.middleware import cors as middleware
 import tempfile
-from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
-import base64
+from sarvamai import SarvamAI, AsyncSarvamAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
 from app.agents.prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
+from app.state import state
+from app.utility.hiveMQ import HiveMQClient
 # from db_utility.vector_db import VectorDB 
-import logging, uvicorn
-from typing import AsyncGenerator, Callable
+import logging
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,22 +25,26 @@ BIT_DEPTH = 32
 # --- Initialization (Assuming classes like VectorDB, AI_TUTOR_PROMPT are defined elsewhere) ---
 llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-flash-lite",
-            temperature=1,
+            temperature=0.6,
             max_output_tokens=8192,
             timeout=30,
             max_retries=2,)
 
-# Initialize with placeholder instances since actual imports are missing
-# try:
-#     vector_db = VectorDB()
-# except NameError:
-#     class DummyVectorDB:
-#         def get_similar_documents(self, query, top_k):
-#             return "Sample context for the query.", ["doc1"]
-#     vector_db = DummyVectorDB()
-#     logger.warning("Using DummyVectorDB as VectorDB class definition was not found.")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    state.async_sarvam_client = AsyncSarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
+    state.sarvam_client = SarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
+    state.mqtt_client = HiveMQClient()
+    try:
+        await state.mqtt_client.connect()
+    except Exception as e:
+        logger.error(f"HiveMQ connection failed: {e}")
+    yield
+    state.async_sarvam_client = None
+    state.sarvam_client = None
+    await state.mqtt_client.disconnect()
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
@@ -52,97 +57,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.routers import auth, user, conversation, message, agent, device
+from app.routers import auth, user, conversation, message, agent, device, notification, mqtt
+
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(user.router, prefix="/api/v1")
 app.include_router(conversation.router, prefix="/api/v1")
 app.include_router(message.router, prefix="/api/v1")
 app.include_router(agent.router, prefix="/api/v1")
+app.include_router(notification.router, prefix="/api/v1")
 app.include_router(device.router, prefix="/api/v1")
+app.include_router(mqtt.router, prefix="/api/v1")
+
 
 client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 
+# Import the pre-buffer + frame-aligned streaming implementation from agents
+from app.agents.utility import streaming_audio_response
 
-async def streaming_audio_response(
-    text: str, language_code: str = "en-IN"
-) -> AsyncGenerator[bytes, None]:
-    client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-    
-    # Ensure output directory exists
-    output_dir = os.path.join(os.path.dirname(__file__), "data")
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "output.mp3")
-    
-    # Open file in async-safe way (sync I/O is fine here because chunks are small)
-    try:
-        async with client.text_to_speech_streaming.connect(model="bulbul:v2", send_completion_event=True) as ws:
-            await ws.configure(target_language_code=language_code, speaker="anushka")
-            
-            # Send text and flush once
-            await ws.convert(text)
-            await ws.flush()
+# Legacy local copy removed — single source of truth is app.agents.utility
 
-            # Stream chunks as they come
-            with open(output_path, "wb") as output_file:
-                async for message in ws:
-                    if isinstance(message, AudioOutput):
-                        audio_chunk = base64.b64decode(message.data.audio)
-                        
-                        # Write to file immediately
-                        output_file.write(audio_chunk)
-                        output_file.flush()
-                        
-                        # Yield to client immediately
-                        yield audio_chunk
-                        await asyncio.sleep(0.5)
-                    
-                    elif isinstance(message, EventResponse):
-                        if message.data.event_type == "final":
-                            break
-
-            # async for message in ws:
-            #     if isinstance(message, AudioOutput):
-            #         audio_chunk = base64.b64decode(message.data.audio)
-                    
-            #         # Yield to client immediately
-            #         yield audio_chunk
-            #         await asyncio.sleep(0.5)
-                
-            #     elif isinstance(message, EventResponse):
-            #         if message.data.event_type == "final":
-            #             break
-
-    except Exception as e:
-        logger.error(f"Error during audio streaming and saving: {e}")
-        raise
-
-# async def streaming_audio_response(text: str, language_code: str = "en-IN") -> AsyncGenerator[bytes, None]:
-#     with open("data/output_v2.mp3", "wb") as output_file:
-#         try:
-#             # Initialize Async Client inside the async function
-#             client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-            
-#             async with client.text_to_speech_streaming.connect(model="bulbul:v2") as ws:
-#                 await ws.configure(target_language_code=language_code, speaker="anushka")
-#                 await ws.convert(text)
-#                 await ws.flush()
-
-#                 async for message in ws:
-#                     if isinstance(message, AudioOutput):
-#                         # Decode the base64 chunk
-#                         audio_chunk = base64.b64decode(message.data.audio)
-                        
-#                         # Write chunk to file
-#                         output_file.write(audio_chunk)
-#                         output_file.flush()
-                        
-#                         # Yield chunk for streaming
-#                         yield audio_chunk
-
-#         except Exception as e:
-#             logger.error(f"Error during audio streaming and saving: {e}")
-#             # Re-raise the exception for FastAPI to handle
-#             raise
 
 @app.get("/test-audio-generator")
 async def test_audio_generator():
@@ -307,9 +240,19 @@ async def voice_assistant(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error in /voice-assistant endpoint: {e}")
         return {"error": str(e)}
-    
+
 @app.get("/testing-audio-stream")
-async def test_tts_stream():
+async def test_tts_stream(request: Request):
+    """
+    Tests the streaming functionality by reading the last saved output.mp3 file.
+    """
+    return StreamingResponse(
+        test_audio_stream(),
+        media_type="audio/mpeg"
+    )    
+
+@app.post("/testing-audio-stream")
+async def test_tts_stream(request: Request):
     """
     Tests the streaming functionality by reading the last saved output.mp3 file.
     """

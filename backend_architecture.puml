@@ -1,0 +1,613 @@
+' ============================================================
+'  BACKEND ARCHITECTURE — vijayebhav_v2
+'  Three diagrams in one file:
+'    1. System Component Architecture
+'    2. LangGraph Agent State Machine
+'    3. Voice-Assistant Request Sequence
+' ============================================================
+
+' ------------------------------------------------------------
+' DIAGRAM 1 — System Component Architecture
+' ------------------------------------------------------------
+@startuml System_Component_Architecture
+!theme plain
+skinparam linetype ortho
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam packageStyle rectangle
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.5
+
+title <b>Backend — System Component Architecture</b>\n<size:11>FastAPI · MongoDB · Firestore · Milvus · Gemini · SarvamAI</size>
+
+'-------- CLIENT ---------
+package "Clients" as Clients #EAF4FB {
+  [Mobile / Web App] as MobileApp
+  [IoT Device\n(Voice)] as Device
+}
+
+'-------- API GATEWAY LAYER --------
+package "FastAPI Application  /api/v1" as FastAPI #FFF9E6 {
+
+  package "Routers (HTTP boundary)" as Routers #FFFDE7 {
+    [auth.py\nPOST /auth/register\nPOST /auth/login\nPOST /auth/google] as AuthRouter
+    [user.py\nGET|PATCH|DELETE /user/me] as UserRouter
+    [conversation.py\nCRUD /conversations] as ConvRouter
+    [message.py\nPOST|GET /messages] as MsgRouter
+    [agent.py\nPOST /agent/query\nPOST /agent/device-voice-assistant] as AgentRouter
+    [device.py\nPOST /devices/online/:id\nPOST /devices/heartbeat/:id\nGET /devices/mine\nGET|PATCH /devices/config\nGET /devices/:id/status\nPOST /devices/:id/unpair\nGET /devices/:id/history\n<size:10>in-memory rate-limit: 5 req / 60 s</size>] as DeviceRouter
+    [notification.py\nGET /notifications\nDELETE /notifications/:id] as NotifRouter
+  }
+
+  package "Legacy Endpoints (main.py)" as LegacyEndpoints #FFF3E0 {
+    [POST /raw-voice-assistant\nPOST /voice-assistant\nGET /test-audio-generator\nGET /testing-audio-stream] as LegacyRoutes
+  }
+
+  package "Utility / Security" as UtilPkg #F1F8E9 {
+    [security.py\nJWT create/decode\nbcrypt · get_current_user()] as Security
+    [firebase_init.py\nFirebase Admin SDK\nverify_firebase_token()] as FirebaseUtil
+  }
+
+  package "Controllers (Business Logic)" as Controllers #E8F5E9 {
+    [AuthController\nregister · login · google_auth] as AuthCtrl
+    [UserController\nget · update · delete profile] as UserCtrl
+    [ConversationController\nCRUD conversations + sessions] as ConvCtrl
+    [MessageController\nappend · fetch messages in session] as MsgCtrl
+    [DeviceConfigController\nget/upsert device learning config] as DevCtrl
+    [DeviceController\nupsert config · notify transfer\nrelease on account deletion] as DeviceCtrl
+    [NotificationController\npaginated fetch · ownership delete] as NotifCtrl
+  }
+
+  package "Agent Layer" as AgentLayer #EDE7F6 {
+    [core_agent.py\nLangGraph StateGraph\nrun_agent()] as CoreAgent
+    [agent_memory_controller.py\nchat history (last 2 msgs)\ndevice_session_id] as MemCtrl
+    [llm.py\nGemini 2.0 flash-lite\nChatGoogleGenerativeAI] as LLM
+    [prompts.py\n9 agent + 2 legacy prompts] as Prompts
+    [schemas.py\nTool-call Pydantic schemas\nQueryClassification · LessonPlan\nEvaluation · TopicAnalysis\n(intent: answer|clarification|new_topic\n off_topic|small_talk|repeat)] as Schemas
+    [utility.py\nSarvamAI TTS pipeline\nsentence_pipelined_tts()\ntts_sentence() · split_into_sentences()\ngenerate_filler_audio()\ntranslate_text() · chunk_text()] as AgentUtil
+  }
+}
+
+'-------- DATA LAYER --------
+package "Data Layer" as DataLayer #FBE9E7 {
+
+  package "MongoDB Atlas  (neurosattva)" as MongoDB #FFEBE6 {
+    database "users" as UsersCol
+    database "conversations" as ConvCol
+    database "sessions\n(messages + agent checkpoints)" as SessionsCol
+    database "devices\n(ownership ledger)" as DevicesCol
+    database "device_config" as DevConfigCol
+    database "notifications" as NotifCol
+    database "messages\n(future use)" as MsgsCol
+  }
+
+  package "Google Cloud Firestore" as Firestore #FCE4EC {
+    database "student_metrics\n(quiz analytics)" as MetricsCol
+  }
+
+  package "Milvus Vector DB" as MilvusDB #E8EAF6 {
+    database "educational_content\n(768-dim COSINE)" as VectorCol
+  }
+}
+
+'-------- EXTERNAL SERVICES --------
+package "External Services" as External #F3E5F5 {
+  [Google Gemini 2.0\nflash-lite\n(LLM inference)] as Gemini
+  [Google GenAI\ngemini-embedding-001\n(768-dim embeddings)] as EmbedAPI
+  [SarvamAI\nSTT: saaras:v2.5\nTTS: bulbul:v2\nTranslate: sarvam-translate:v1] as Sarvam
+  [Firebase Auth\n(Google Sign-In token\nverification)] as FirebaseAuth
+}
+
+'-------- RELATIONSHIPS --------
+
+' Clients → Routers
+MobileApp --> AuthRouter : HTTPS REST
+MobileApp --> UserRouter
+MobileApp --> ConvRouter
+MobileApp --> MsgRouter
+MobileApp --> AgentRouter : text query
+MobileApp --> DeviceRouter
+MobileApp --> NotifRouter
+Device --> AgentRouter : raw WAV
+Device --> LegacyRoutes : raw WAV (legacy)
+
+' Router → Security
+AuthRouter ..> Security : get_current_user()
+UserRouter ..> Security
+ConvRouter ..> Security
+MsgRouter ..> Security
+AgentRouter ..> Security
+DeviceRouter ..> Security
+NotifRouter ..> Security
+
+' Router → Controller
+AuthRouter --> AuthCtrl
+UserRouter --> UserCtrl
+ConvRouter --> ConvCtrl
+MsgRouter --> MsgCtrl
+AgentRouter --> CoreAgent
+DeviceRouter --> DevCtrl
+DeviceRouter --> DeviceCtrl
+NotifRouter --> NotifCtrl
+
+' Auth → Firebase util
+AuthCtrl --> FirebaseUtil : google_auth flow
+
+' Controllers → DB
+AuthCtrl --> UsersCol
+UserCtrl --> UsersCol
+ConvCtrl --> ConvCol
+ConvCtrl --> SessionsCol
+MsgCtrl --> SessionsCol
+DevCtrl --> DevConfigCol
+DeviceCtrl --> DevicesCol
+DeviceCtrl --> DevConfigCol : ownership change
+DeviceCtrl --> NotifCol : transfer notification
+NotifCtrl --> NotifCol
+
+' Security → DB
+Security --> UsersCol : lookup user by id
+
+' Agent internal wiring
+CoreAgent --> LLM
+CoreAgent --> MemCtrl
+CoreAgent --> Prompts
+CoreAgent --> Schemas
+CoreAgent --> AgentUtil
+MemCtrl --> SessionsCol : chat history\n+ checkpoints
+
+' Agent → DB / Vector
+CoreAgent --> SessionsCol : MongoDBSaver\ncheckpoint
+' NOTE: VectorDB (Milvus) integration exists in vector_db.py but is currently DEACTIVATED
+'       get_similar_documents() is commented out — no vector search in current agent.
+' CoreAgent ..> VectorCol : get_similar_documents()  [INACTIVE]
+
+' Legacy endpoints wiring
+' NOTE: In main.py legacy routes — STT + Gemini LLM calls are commented out.
+' Only GET /test-audio-generator (TTS via SarvamAI) is fully active.
+LegacyRoutes --> Sarvam : TTS (active) / STT+LLM inactive
+' LegacyRoutes --> Gemini : LLM (legacy prompts)  [INACTIVE — commented out]
+
+' External service calls
+LLM --> Gemini : inference
+' VectorCol ..> EmbedAPI : embed query  [INACTIVE — vector search deactivated]
+AgentUtil --> Sarvam : TTS streaming
+AgentRouter --> Sarvam : STT (WAV → text)
+FirebaseUtil --> FirebaseAuth : verify_id_token()
+Firestore ..> MetricsCol
+
+@enduml
+
+
+' ------------------------------------------------------------
+' DIAGRAM 2 — LangGraph Guided-Learning Agent State Machine
+' ------------------------------------------------------------
+@startuml LangGraph_Agent_State_Machine
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam ArrowColor #444444
+skinparam ArrowThickness 1.5
+skinparam ActivityBorderColor #888888
+skinparam ActivityBackgroundColor #F5F5F5
+skinparam ActivityDiamondBackgroundColor #FFF9C4
+skinparam NoteBackgroundColor #E3F2FD
+skinparam noteBorderColor #90CAF9
+
+title <b>LangGraph Guided-Learning Agent — State Machine</b>\n<size:11>core_agent.py · MongoDBSaver checkpointer · Gemini 2.0 flash-lite</size>
+
+start
+
+:run_agent(user, query, session_id);
+
+note right
+  **AgentState** fields:
+  · query, user, messages
+  · mode ("general" | "explanation")
+  · topic, lesson_plan[], lesson_step
+  · awaiting_lesson_confirmation
+  · pending_topic, feedback
+  · last_explanation  ← stores last AI message
+  ·   (used by repeat-request fast path)
+  · last_action, session_id
+end note
+
+:Load checkpoint from MongoDB\n(MongoDBSaver — thread_id = session_id);
+
+if (is_small_talk(query)\nAND no active lesson?) then (yes)
+  :handle_small_talk()\n<i>1 LLM call — filler phrase</i>;
+  stop
+else (no)
+endif
+
+if (awaiting_lesson_confirmation == True?) then (yes)
+  :Node: **handle_lesson_confirmation**\n<i>Regex fast-path — zero LLM cost</i>;
+  if (is_yes(query)) then (confirmed)
+    :Node: **plan_lesson**\n<i>LLM + LessonPlanSchema tool</i>\n→ 3–5 subtopic steps;
+    :Node: **generate_explanation**\n<i>LLM — TUTOR_EXPLANATION_PROMPT</i>\n→ explain lesson_step[0];
+    stop
+  elseif (is_no(query)) then (declined)
+    :Set mode = "general"\nClear lesson state;
+    stop
+  else (ambiguous)
+    :→ classify_query;
+  endif
+elseif (mode == "explanation"\nAND topic AND lesson_plan?) then (yes)
+  :Node: **analyze_topic**\n<i>fast-path: repeat / small_talk</i>\n<i>else: LLM + TopicAnalysisSchema tool</i>;
+  note right
+    TopicAnalysisSchema:
+    **intent**: answer | clarification
+    | new_topic | off_topic_question
+    | small_talk | repeat_request
+    **suggested_action**:
+    continue_lesson | answer_and_continue
+    | switch_topic | politely_redirect
+    | handle_small_talk | repeat_last_message
+  end note
+  if (intent == "context_analyzed") then
+    :Node: **evaluate_response**\n<i>LLM + EvaluationSchema tool</i>\n→ is_correct, feedback, understanding_level;
+    if (lesson_step > len(lesson_plan)) then (lesson complete)
+      :Node: **complete_lesson**\n<i>LLM — LESSON_COMPLETE_PROMPT</i>\n→ reset mode = "general";
+      stop
+    else (continue)
+      :Node: **generate_explanation**\n→ next lesson_step;
+      stop
+    endif
+  elseif (intent == "exited_lesson") then
+    :Clear lesson state\n→ classify_query;
+  else (small_talk / repeated /\nredirected / waiting)
+    :Return contextual\nresponse directly;
+    stop
+  endif
+else (no active lesson / general mode)
+endif
+
+:Node: **classify_query**\n<i>LLM + QueryClassificationSchema tool</i>\n→ query_type: "explanation" | "general"\n→ topic: string;
+
+if (query_type == "explanation") then
+  :Node: **brief_answer_and_offer**\n<i>LLM — BRIEF_ANSWER_PROMPT</i>\n→ brief answer + offer full lesson\n→ set awaiting_lesson_confirmation = True;
+  stop
+else (general)
+  :Node: **general_answer**\n<i>LLM — GENERAL_ANSWER_PROMPT</i>\n→ direct conversational answer;
+  stop
+endif
+
+@enduml
+
+
+' ------------------------------------------------------------
+' DIAGRAM 3 — Voice-Assistant End-to-End Request Sequence
+' ------------------------------------------------------------
+@startuml Voice_Assistant_Request_Sequence
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam ArrowColor #444444
+skinparam ArrowThickness 1.5
+skinparam SequenceBoxBorderColor #AAAAAA
+skinparam SequenceGroupBorderColor #9E9E9E
+skinparam SequenceGroupBodyBackgroundColor #FAFAFA
+skinparam NoteBackgroundColor #E8F4FD
+skinparam noteBorderColor #90CAF9
+skinparam ParticipantBackgroundColor #F5F5F5
+
+title <b>Voice-Assistant End-to-End Request Sequence</b>\n<size:11>POST /api/v1/agent/device-voice-assistant</size>
+
+actor "IoT Device" as Device
+participant "agent.py\nRouter" as Router
+participant "security.py\nget_current_user()" as Security
+participant "MongoDB\nusers" as UserDB
+participant "SarvamAI STT\nsaaras:v2.5" as STT
+participant "core_agent.py\nrun_agent()" as Agent
+participant "LangGraph\nStateGraph" as Graph
+participant "Gemini 2.0\nflash-lite" as LLM
+participant "MongoDB\nsessions\n(checkpoints)" as CheckpointDB
+participant "SarvamAI TTS\nbulbul:v2" as TTS
+
+Device -> Router : POST /agent/device-voice-assistant\nContent-Type: audio/wav\nAuthorization: Bearer <jwt>\n<raw 32-bit PCM WAV body>
+
+Router -> Security : get_current_user(jwt)
+Security -> UserDB : find_one({"_id": user_id})
+UserDB --> Security : user dict
+Security --> Router : current_user
+
+note over Router
+  Cancel any active audio stream
+  for this user (asyncio.Event)
+end note
+
+Router -> STT : transcribe(wav_bytes)\nmodel=saaras:v2.5
+STT --> Router : {transcript, language_code}
+
+Router -> Agent : asyncio.to_thread(\n  run_agent(user, transcript, session_id)\n)
+
+Agent -> CheckpointDB : load checkpoint\n(thread_id = "device_session_id_<user_id>")
+CheckpointDB --> Agent : AgentState (or empty)
+
+group LangGraph Graph Invocation
+  Agent -> Graph : invoke(input_state, config)
+
+  alt small_talk and no active lesson
+    Graph -> LLM : handle_small_talk()
+    LLM --> Graph : filler phrase
+  else normal flow
+    Graph -> LLM : classify_query\n(QueryClassificationSchema)
+    LLM --> Graph : {query_type, topic}
+
+    alt explanation query
+      Graph -> LLM : brief_answer_and_offer
+      LLM --> Graph : brief answer + lesson offer
+    else general query
+      Graph -> LLM : general_answer
+      LLM --> Graph : full answer
+    end
+
+  end
+
+  Graph -> CheckpointDB : save checkpoint\n(updated AgentState)
+end
+
+Agent --> Router : response text (string)
+
+note over Router
+  Create new cancellable stream
+  event for this user_id
+end note
+
+group Sentence-Pipelined TTS  (sentence_pipelined_tts)
+  loop for each sentence in response
+    Router -> TTS : tts_sentence(sentence, language_code)\nbulbul:v2 WebSocket
+    TTS --> Router : audio bytes (MP3)
+    Router --> Device : yield 8 KB audio chunk\nContent-Type: audio/mpeg
+  end
+end
+
+Device --> Device : Buffer + play\nstreaming audio
+
+note over Router, Device
+  If a new request arrives mid-stream,
+  asyncio.Event cancels the current
+  generator and starts fresh.
+end note
+
+@enduml
+
+
+' ------------------------------------------------------------
+' DIAGRAM 4 — Authentication Flow Sequence
+' ------------------------------------------------------------
+@startuml Authentication_Flow_Sequence
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam ArrowColor #444444
+skinparam ArrowThickness 1.5
+skinparam NoteBackgroundColor #E8F4FD
+skinparam noteBorderColor #90CAF9
+skinparam ParticipantBackgroundColor #F5F5F5
+
+title <b>Authentication Flow</b>\n<size:11>Email · Google Sign-In · JWT Protected Routes</size>
+
+actor "Client" as Client
+participant "auth.py\nRouter" as AuthRouter
+participant "AuthController" as AuthCtrl
+participant "firebase_init.py\nverify_firebase_token()" as FirebaseUtil
+participant "Firebase Auth" as FirebaseAuth
+participant "MongoDB\nusers" as UserDB
+participant "security.py\ncreate_access_token()" as Security
+participant "Protected\nRouter" as ProtectedRouter
+
+== Email Registration ==
+Client -> AuthRouter : POST /auth/register\n{name, email, password, grade, board}
+AuthRouter -> AuthCtrl : register_user(data)
+AuthCtrl -> UserDB : find_one({email}) → check duplicate
+AuthCtrl -> AuthCtrl : bcrypt.hash(password)
+AuthCtrl -> AuthCtrl : uuid4() → user_id
+AuthCtrl -> UserDB : insert_one(user_doc)
+AuthCtrl -> Security : create_access_token({"sub": user_id})\nHS256 · 30-day expiry
+Security --> AuthCtrl : jwt_token
+AuthCtrl --> Client : 201 {user, token}
+
+== Email Login ==
+Client -> AuthRouter : POST /auth/login\n{email, password}
+AuthRouter -> AuthCtrl : login_user(credentials)
+AuthCtrl -> UserDB : find_one({email})
+AuthCtrl -> AuthCtrl : bcrypt.verify(password, hash)
+AuthCtrl -> Security : create_access_token({"sub": user_id})
+Security --> AuthCtrl : jwt_token
+AuthCtrl --> Client : 200 {user, token}
+
+== Google Sign-In (Firebase) ==
+Client -> AuthRouter : POST /auth/google\n{id_token: "<Firebase ID token>"}
+AuthRouter -> AuthCtrl : google_auth(id_token)
+AuthCtrl -> FirebaseUtil : verify_firebase_token(id_token)
+FirebaseUtil -> FirebaseAuth : auth.verify_id_token(id_token)\n[Firebase Admin SDK]
+FirebaseAuth --> FirebaseUtil : {uid, email, name, photo_url}
+FirebaseUtil --> AuthCtrl : decoded token claims
+AuthCtrl -> UserDB : find_one({firebase_uid}) or find_one({email})
+AuthCtrl -> UserDB : upsert (account_type="google")
+AuthCtrl -> Security : create_access_token({"sub": user_id})
+Security --> AuthCtrl : jwt_token
+AuthCtrl --> Client : 200 {user, token}
+
+== Accessing a Protected Route ==
+Client -> ProtectedRouter : GET /user/me\nAuthorization: Bearer <jwt>
+ProtectedRouter -> Security : get_current_user(token)\n[OAuth2PasswordBearer dependency]
+Security -> Security : jwt.decode(token, SECRET_KEY, HS256)
+Security -> UserDB : find_one({"_id": user_id})
+UserDB --> Security : user dict
+Security --> ProtectedRouter : current_user dict\n[injected via Depends()]
+ProtectedRouter --> Client : 200 {user profile}
+
+note over Security
+  On failure:
+  · Invalid/expired token → 401
+  · User not in DB → 401
+  Header: WWW-Authenticate: Bearer
+end note
+
+@enduml
+
+
+' ------------------------------------------------------------
+' DIAGRAM 5 — Database Schema (Entity Relationship)
+' ------------------------------------------------------------
+@startuml Database_Schema
+!theme plain
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.2
+skinparam ClassBackgroundColor #FAFAFA
+skinparam ClassBorderColor #AAAAAA
+skinparam ClassHeaderBackgroundColor #E8EAF6
+
+title <b>MongoDB — Collection Schemas &amp; Relationships</b>\n<size:11>Database: neurosattva</size>
+
+entity "users" as Users {
+  * _id : String <<UUID>> <<PK>>
+  --
+  name : String
+  email : String <<unique index>>
+  password : String | null  // bcrypt hash
+  photo_url : String | null
+  grade : String | null
+  board : String | null
+  personalized_response : Boolean
+  account_type : "email" | "google"
+  firebase_uid : String | null  <<sparse index>>
+  created_at : DateTime  <<index>>
+  updated_at : DateTime | null
+}
+
+entity "conversations" as Conversations {
+  * _id : String <<UUID>> <<PK>>
+  --
+  user_id : String  <<FK → users._id>>
+  topic : String
+  created_at : DateTime
+  updated_at : DateTime
+}
+
+entity "sessions" as Sessions {
+  * _id : String <<UUID = conversation._id>> <<PK>>
+  --
+  messages : Array<EmbeddedMessage>
+  //  Also stores LangGraph agent checkpoints
+  //  keyed as "device_session_id_<user_id>"
+}
+
+entity "EmbeddedMessage" as EmbMsg {
+  type : "human" | "ai"
+  data.content : String
+  data.sources : Array
+  data.image_links : Array
+  timestamp : DateTime
+}
+
+entity "device_config" as DeviceConfig {
+  * _id : String <<UUID>> <<PK>>
+  --
+  user_id : String  <<FK → users._id, unique index>>
+  device_id : String | null  // linked device
+  device_online : Boolean | null
+  learning_mode : "Strict" | "Normal"
+  response_type : "Detailed" | "Concise"
+  difficulty_level : "Beginner" | "Intermediate" | "Advanced"
+  last_seen_at : DateTime | null
+  created_at : DateTime
+  updated_at : DateTime | null
+}
+
+entity "notifications" as Notifications {
+  * _id : String <<PK>>
+  --
+  user_id : String  <<FK → users._id, index>>
+  message : String
+  type : "info" | "warn" | "err"
+  created_at : DateTime  <<sorted desc>>
+}
+
+entity "messages" as Messages {
+  * _id : ObjectId <<PK>>
+  --
+  conversation_id : String  <<FK → conversations._id>>
+  created_at : DateTime
+  ' (future use — messages currently
+  '  stored in sessions as embedded docs)
+}
+
+entity "Firestore: student_metrics" as Metrics {
+  * doc_id : String <<user_id>> <<PK>>
+  --
+  overall_accuracy : Float
+  average_accuracy : Float
+  average_score : Float
+  subject_wise_accuracy : Map<String, Float>
+  subject_wise_average_score : Map<String, Float>
+  quizzes_taken_count : Int
+  subject_wise_quizzes_taken_count : Map<String, Int>
+  difficulty_wise_accuracy : Map<String, Float>
+  difficulty_wise_average_score : Map<String, Float>
+  difficulty_wise_quizzes_taken_count : Map<String, Int>
+}
+
+entity "Milvus: educational_content" as VectorDB {
+  * id : Int64 <<PK>>
+  --
+  vector : Float[768]  // gemini-embedding-001 COSINE
+  content : String
+  board : String
+  grade : String
+  subject : String
+  chapter : String
+  source : String
+  similarity_threshold : 0.6
+}
+
+entity "devices" as Devices {
+  * _id : String <<device_id = PK>>
+  --
+  device_id : String
+  firmware_version : String | null
+  hardware_revision : String | null
+  owner_user_id : String | null  <<FK → users._id, index>>
+  ownership_status : "unclaimed" | "active"  <<index>>
+  claimed_at : DateTime | null
+  last_provisioned_at : DateTime | null
+  is_online : Boolean
+  last_seen_at : DateTime | null  <<index>>
+  ip_address : String | null
+  pending_transfer : EmbeddedTransfer | null  <<TTL sparse index>>
+  ownership_history : Array<OwnershipEntry>  // max 20 entries
+  created_at : DateTime
+  updated_at : DateTime
+}
+
+entity "EmbeddedTransfer" as EmbTransfer {
+  new_user_id : String
+  initiated_at : DateTime
+  expires_at : DateTime  // +15 min — TTL index target
+}
+
+entity "OwnershipEntry" as OwnEntry {
+  user_id : String
+  claimed_at : DateTime
+  released_at : DateTime | null
+  release_reason : "transfer" | "manual_unpair" | "admin" | "account_deleted" | null
+  transfer_to_user : String | null
+}
+
+' Relationships
+Users ||--o{ Conversations : "user_id"
+Users ||--o| DeviceConfig : "user_id"
+Users ||--o{ Notifications : "user_id"
+Users ||--o| Metrics : "doc_id = user_id"
+Users ||--o{ Devices : "owner_user_id"
+Conversations ||--|| Sessions : "_id (1:1 pair)"
+Sessions ||--o{ EmbMsg : "messages[]"
+Conversations ||--o{ Messages : "conversation_id\n(future)"
+Devices ||--o| EmbTransfer : "pending_transfer"
+Devices ||--o{ OwnEntry : "ownership_history[]"
+
+@enduml
