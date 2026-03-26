@@ -50,6 +50,8 @@ package "Device Management" as DevMgmt #FBE9E7 {
   usecase "Pair a Voice Device\nto your Account" as UC_Pair
   usecase "Configure Learning Style\n(Normal/Strict, Concise/Detailed,\nBeginner/Intermediate/Advanced)" as UC_Config
   usecase "Transfer / Unpair Device" as UC_Unpair
+  usecase "Download Latest Firmware\n(OTA self-update via GCS)" as UC_Firmware
+  usecase "Send MQTT Command\nto Device" as UC_MQTT
 }
 
 package "Notifications" as Notifs #F3E5F5 {
@@ -67,11 +69,13 @@ Student --> UC_Memory
 Student --> UC_Pair
 Student --> UC_Config
 Student --> UC_Unpair
+Student --> UC_MQTT
 Student --> UC_Notif
 
 Device --> UC_Voice
 Device --> UC_Interrupt
 Device --> UC_Lang
+Device --> UC_Firmware
 
 UC_Voice ..> UC_General : "spoken query\ntranscribed → AI response → spoken back"
 UC_Voice ..> UC_Lesson  : "guided lesson\ndelivered as voice"
@@ -257,6 +261,8 @@ rectangle "🔧  Device Management" as DM #FBE9E7 {
   rectangle "Learning Configuration\nAdjust difficulty, verbosity, and style" as R16
   rectangle "Ownership Transfer\nSafely reassign a device to a new student" as R17
   rectangle "Status Monitoring\nOnline / offline tracking" as R18
+  rectangle "Firmware OTA Update\nDevice pulls latest .bin from GCS\n(GET /devices/firmware/download)" as R20
+  rectangle "MQTT Command Publishing\nSend raw commands to device topics\n(POST /mqtt/publish — HiveMQ Cloud)" as R21
 }
 
 rectangle "🔔  Notifications" as NF #F3E5F5 {

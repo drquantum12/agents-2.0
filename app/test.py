@@ -1,41 +1,31 @@
-from langchain.chat_models import init_chat_model
-from langgraph.graph import StateGraph, MessagesState, START
-from langgraph.checkpoint.mongodb import MongoDBSaver  
-from app.agents.llm import LLM
+import os
+from pymongo import MongoClient
+from bson import Decimal128
 
-llm = LLM().get_llm()
 
-DB_URI = os.getenv("MONGODB_CONNECTION_STRING")
-checkpointer = MongoDBSaver.from_conn_string(DB_URI)
+def _d128_to_float(value):
+    """Convert a bson.Decimal128 to float; pass through other types unchanged."""
+    if isinstance(value, Decimal128):
+        return float(value.to_decimal())
+    return value
 
-if __name__ == "__main__":
-    def call_model(state: MessagesState):
-        response = llm.invoke(state["messages"])
-        return {"messages": response}
+DB_URI = os.getenv("DB_URI", "mongodb+srv://arjuntomar:4mzs8E9gdeLAfw8r@cluster0.w6pyfx8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 
-    builder = StateGraph(MessagesState)
-    builder.add_node(call_model)
-    builder.add_edge(START, "call_model")
-
-    graph = builder.compile(checkpointer=checkpointer)  
-
-    config = {
-        "configurable": {
-            "thread_id": "1"
-        }
-    }
-
-    for chunk in graph.stream(
-        {"messages": [{"role": "user", "content": "hi! I'm bob"}]},
-        config,  
-        stream_mode="values"
-    ):
-        chunk["messages"][-1].pretty_print()
-
-    for chunk in graph.stream(
-        {"messages": [{"role": "user", "content": "what's my name?"}]},
-        config,  
-        stream_mode="values"
-    ):
-        chunk["messages"][-1].pretty_print()
+mongo_db = MongoClient(DB_URI).get_database("neurosattva")
     
+if __name__ == "__main__":
+    devices = list(
+        mongo_db["devices"]
+        .find({"owner_user_id": "ptLFqq0N9JTyYL7lkAqhB1YSFj32", "ownership_status": "active"})
+        .limit(50)
+    )
+    for d in devices:
+        d["device_id"] = d.get("_id", d.get("device_id"))
+    print({"devices": devices})
+
+#    firmware = mongo_db["firmware"].find_one(
+#             sort=[("version", -1)],
+#             projection={"version": 1},
+#         )
+   
+#    print(_d128_to_float(firmware["version"]))
