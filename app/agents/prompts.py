@@ -111,6 +111,20 @@ Example response style:
 Answer now."""
 
 
+# --- Step 2c: Classify yes/no/new_query confirmation ---
+CONFIRMATION_CLASSIFIER_PROMPT = """You are classifying whether a user is confirming, declining, or ignoring a lesson offer.
+
+The assistant just offered: "{offer_message}"
+The user replied: "{user_reply}"
+
+Use the ConfirmationSchema tool to classify the reply as exactly one of:
+- "yes"       — User agrees, even with extra words (e.g. "yes tell me in detail", "sure go ahead", "I'd love that", "why not")
+- "no"        — User declines (e.g. "no thanks", "not now", "maybe later", "I'm good")
+- "new_query" — User ignored the offer and asked something completely new
+
+Classify now."""
+
+
 # --- Step 3: Plan lesson (3-5 subtopics) ---
 LESSON_PLANNER_PROMPT = """You are an expert Lesson Planner AI specializing in creating structured, engaging learning paths.
 

@@ -6,12 +6,16 @@ from app.agents.core_agent import run_agent
 from app.utility.security import get_current_user
 from app.models.user import User
 import tempfile
-from app.agents.utility import translate_text, streaming_audio_response
+from app.agents.utility import translate_text, streaming_audio_response, test_audio_stream
 from app.agents.agent_memory_controller import get_or_create_device_session_id
-import os
+import os, io
 from typing import AsyncGenerator
 import logging
 from app.state import state
+
+import noisereduce as nr
+import numpy as np
+import soundfile as sf
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["Agent"])
@@ -75,20 +79,38 @@ async def device_voice_assistant(request: Request,
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no"
     }
-    # 1. Receive user audio
+    # 1. Receive user audio 
     wav_data = await request.body()
 
     # with open("app/data/input_32bit.wav", "wb") as f:
     #         f.write(wav_data)
 
+    audio, sample_rate = sf.read(io.BytesIO(wav_data))
+    noise_sample = audio[:int(sample_rate * 1)]  # First 0.5 seconds as noise sample
+    reduced_audio = nr.reduce_noise(
+    y=audio,
+    sr=sample_rate,
+    y_noise=noise_sample,
+    prop_decrease=1, # Full noise reduction
+    stationary=False, # Non-stationary noise reduction
+    )
+
+    # sf.write("app/data/denoised_output.wav", reduced_audio, sample_rate)
+    # return StreamingResponse(
+    #     test_audio_stream(),
+    #     media_type="audio/mpeg",
+    #     headers=headers
+    # )
+
     # 2. Speech-to-text + language detection
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as temp_audio:
-        temp_audio.write(wav_data)
-        temp_audio.flush()
-        result = state.sarvam_client.speech_to_text.translate(
-            file=temp_audio,
-            model="saaras:v2.5"
-        )
+    wav_buf = io.BytesIO()
+    sf.write(wav_buf, reduced_audio, sample_rate, format="WAV")
+    wav_buf.seek(0)
+    wav_buf.name = "audio.wav"
+    result = state.sarvam_client.speech_to_text.translate(
+        file=wav_buf,
+        model="saaras:v2.5"
+    )
 
     language_code = result.language_code if result.language_code else ""
 
@@ -100,6 +122,14 @@ async def device_voice_assistant(request: Request,
             media_type="audio/mpeg",
             headers=headers,
         )
+    
+    # print(f"Detected language code: {language_code}")
+    # print(f"Transcript: {result.transcript}")
+    # return StreamingResponse(
+    #     test_audio_stream(),
+    #     media_type="audio/mpeg",
+    #     headers=headers
+    # )
 
     # --- Interruption logic ---
     user_id = str(user["_id"])

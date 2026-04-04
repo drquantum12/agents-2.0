@@ -51,6 +51,18 @@ class EvaluationSchema(BaseModel):
     )
 
 
+class ConfirmationSchema(BaseModel):
+    """Schema for classifying a user's response to a lesson offer."""
+    intent: Literal['yes', 'no', 'new_query'] = Field(
+        ...,
+        description=(
+            "'yes' if the user is agreeing to or confirming the lesson offer (even with extra words like 'yes tell me more', 'sure go ahead', 'I'd love that'). "
+            "'no' if the user is declining (e.g. 'no thanks', 'not now', 'I'm good'). "
+            "'new_query' if the user ignored the offer and asked a completely new question."
+        )
+    )
+
+
 class TopicAnalysisSchema(BaseModel):
     """Schema for analyzing if user's query is related to current lesson or represents a topic change."""
     is_related: bool = Field(

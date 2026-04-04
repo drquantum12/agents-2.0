@@ -11,6 +11,16 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE_BYTES = 32 * 1024  # 32 KB
 
+async def test_audio_stream():
+    # Helper for testing the stream from file
+    try:
+        with open("app/data/sample.mp3", "rb") as audio_file:
+            while chunk := audio_file.read(100000):  # 100KB chunks
+                yield chunk
+                await asyncio.sleep(0)
+    except FileNotFoundError:
+        yield b'Audio file not found. Run /raw-voice-assistant or /voice-assistant first.'
+        await asyncio.sleep(0)
 
 async def streaming_audio_response(
     text: str, language_code: str = "en-IN"

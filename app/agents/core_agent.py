@@ -11,6 +11,7 @@ from app.agents.prompts import (
     QUERY_CLASSIFIER_PROMPT,
     GENERAL_ANSWER_PROMPT,
     BRIEF_ANSWER_PROMPT,
+    CONFIRMATION_CLASSIFIER_PROMPT,
     LESSON_PLANNER_PROMPT,
     TUTOR_EXPLANATION_PROMPT,
     EVALUATOR_PROMPT,
@@ -24,6 +25,7 @@ import re
 import random
 from app.agents.schemas import (
     QueryClassificationSchema,
+    ConfirmationSchema,
     LessonPlanSchema,
     EvaluationSchema,
     TopicAnalysisSchema,
@@ -35,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 llm = LLM().get_llm()
 llm_with_classifier_tool = llm.bind_tools(tools=[QueryClassificationSchema])
+llm_with_confirmation_tool = llm.bind_tools(tools=[ConfirmationSchema])
 llm_with_lesson_tool = llm.bind_tools(tools=[LessonPlanSchema])
 llm_with_eval_tool = llm.bind_tools(tools=[EvaluationSchema])
 llm_with_topic_analysis_tool = llm.bind_tools(tools=[TopicAnalysisSchema])
@@ -282,20 +285,21 @@ def brief_answer_and_offer(state: AgentState) -> dict:
 def handle_lesson_confirmation(state: AgentState) -> dict:
     """
     Handles user's yes/no response to the lesson offer.
-    Uses regex fast-path, no LLM call needed.
+    Fast-path regex for obvious single-word responses; LLM fallback for everything else.
     """
     query = state.get('query', '')
     logger.info(f"Handling lesson confirmation: {query}")
 
+    # Fast path: unambiguous bare responses (zero LLM cost)
     if is_yes(query):
-        logger.info("User confirmed lesson -> entering explanation mode")
+        logger.info("User confirmed lesson (fast path) -> entering explanation mode")
         return {
             "last_action": "confirmed_lesson",
             "awaiting_lesson_confirmation": False,
             "mode": "explanation",
         }
-    elif is_no(query):
-        logger.info("User declined lesson -> staying in general mode")
+    if is_no(query):
+        logger.info("User declined lesson (fast path) -> staying in general mode")
         msg = AIMessage(content="No problem at all! Feel free to ask me anything else whenever you are ready.")
         return {
             "messages": [msg],
@@ -304,9 +308,50 @@ def handle_lesson_confirmation(state: AgentState) -> dict:
             "pending_topic": "",
             "mode": "general",
         }
-    else:
-        # Ambiguous -- treat as a new query in general mode
-        logger.info("Ambiguous confirmation response, treating as new query")
+
+    # LLM fallback: handles natural language like "yes tell me in more detail",
+    # "sure go ahead", "I'd love that", "not right now", "what is gravity?" etc.
+    logger.info("Ambiguous confirmation — using LLM to classify intent")
+    offer_message = state.get('last_explanation', 'Would you like a detailed lesson on this topic?')
+    try:
+        prompt = CONFIRMATION_CLASSIFIER_PROMPT.format(
+            offer_message=offer_message,
+            user_reply=query,
+        )
+        response = llm_with_confirmation_tool.invoke(prompt)
+
+        intent = "new_query"  # safe default
+        if response.tool_calls:
+            intent = response.tool_calls[0]['args'].get('intent', 'new_query')
+
+        logger.info(f"LLM confirmation intent: {intent}")
+
+        if intent == 'yes':
+            return {
+                "last_action": "confirmed_lesson",
+                "awaiting_lesson_confirmation": False,
+                "mode": "explanation",
+            }
+        elif intent == 'no':
+            msg = AIMessage(content="No problem at all! Feel free to ask me anything else whenever you are ready.")
+            return {
+                "messages": [msg],
+                "last_action": "declined_lesson",
+                "awaiting_lesson_confirmation": False,
+                "pending_topic": "",
+                "mode": "general",
+            }
+        else:  # new_query
+            return {
+                "last_action": "ambiguous_confirmation",
+                "awaiting_lesson_confirmation": False,
+                "pending_topic": "",
+                "mode": "general",
+            }
+
+    except Exception as e:
+        logger.error(f"Error in LLM confirmation classifier: {e}")
+        # On error, treat as new query
         return {
             "last_action": "ambiguous_confirmation",
             "awaiting_lesson_confirmation": False,
