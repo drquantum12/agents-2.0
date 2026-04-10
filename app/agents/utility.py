@@ -3,27 +3,40 @@ import tempfile, base64
 import logging
 from typing import AsyncGenerator
 import os
-import asyncio
+import asyncio, random
 from app.state import state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE_BYTES = 32 * 1024  # 32 KB
+CHUNK_SIZE_BYTES = 32 * 1024  # 32 KB — smaller chunks reduce perceived latency on Cloud Run
 
 async def test_audio_stream():
     # Helper for testing the stream from file
     try:
         with open("app/data/sample.mp3", "rb") as audio_file:
-            while chunk := audio_file.read(100000):  # 100KB chunks
+            while chunk := audio_file.read(CHUNK_SIZE_BYTES):
                 yield chunk
                 await asyncio.sleep(0)
     except FileNotFoundError:
         yield b'Audio file not found. Run /raw-voice-assistant or /voice-assistant first.'
         await asyncio.sleep(0)
 
+# testing audio stream with random network jitters
+async def test_audio_stream_with_jitter():
+    try:
+        with open("app/data/sample.mp3", "rb") as audio_file:
+            while chunk := audio_file.read(CHUNK_SIZE_BYTES):
+                yield chunk
+                await asyncio.sleep(random.uniform(3.0, 6.0))  # Simulate 3s to 6s network jitter
+    except FileNotFoundError:
+        yield b'Audio file not found. Run /raw-voice-assistant or /voice-assistant first.'
+        await asyncio.sleep(0)
+
 async def streaming_audio_response(
-    text: str, language_code: str = "en-IN"
+    text: str, language_code: str = "en-IN",
+    save_response: bool = False,
+    speech_sample_rate: int = 8000
 ) -> AsyncGenerator[bytes, None]:
     """Stream MP3 audio from Sarvam TTS, yielding each chunk as-is from the API."""
 
@@ -32,23 +45,43 @@ async def streaming_audio_response(
         async with state.async_sarvam_client.text_to_speech_streaming.connect(
             model="bulbul:v2", send_completion_event=True
         ) as ws:
-            await ws.configure(target_language_code=language_code, speaker="anushka")
+            await ws.configure(target_language_code=language_code, speaker="anushka" 
+                               , speech_sample_rate=speech_sample_rate
+                               )
             await ws.convert(text)
             await ws.flush()
-
-            async for message in ws:
-                if isinstance(message, AudioOutput):
-                    audio_chunk = base64.b64decode(message.data.audio)
-                    audio_buffer.extend(audio_chunk)
-                    # yield chunk
-                    if len(audio_buffer) >= CHUNK_SIZE_BYTES:
-                        yield bytes(audio_buffer)
-                        audio_buffer.clear()
-                elif isinstance(message, EventResponse):
-                    if message.data.event_type == "final":
-                        if audio_buffer:
-                            yield bytes(audio_buffer)
-                        break
+            if save_response:
+                with open("app/data/audio_out_16Khz.mp3", "wb") as f:
+                    async for message in ws:
+                        if isinstance(message, AudioOutput):
+                            audio_chunk = base64.b64decode(message.data.audio)
+                            audio_buffer.extend(audio_chunk)
+                            f.write(audio_chunk)
+                            if len(audio_buffer) >= CHUNK_SIZE_BYTES:
+                                yield bytes(audio_buffer)
+                                audio_buffer.clear()
+                                await asyncio.sleep(0)  # yield control so other coroutines can run
+                        elif isinstance(message, EventResponse):
+                            if message.data.event_type == "final":
+                                if audio_buffer:
+                                    yield bytes(audio_buffer)
+                                    await asyncio.sleep(0)
+                                break
+            else:
+                async for message in ws:
+                    if isinstance(message, AudioOutput):
+                            audio_chunk = base64.b64decode(message.data.audio)
+                            audio_buffer.extend(audio_chunk)
+                            if len(audio_buffer) >= CHUNK_SIZE_BYTES:
+                                yield bytes(audio_buffer)
+                                audio_buffer.clear()
+                                await asyncio.sleep(0)  # yield control so other coroutines can run
+                    elif isinstance(message, EventResponse):
+                        if message.data.event_type == "final":
+                            if audio_buffer:
+                                yield bytes(audio_buffer)
+                                await asyncio.sleep(0)
+                            break
 
     except Exception as e:
         logger.error(f"Error during audio streaming: {e}")
