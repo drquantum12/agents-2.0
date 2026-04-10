@@ -83,7 +83,7 @@ async def test_audio_generator():
 Robotic intelligence is the integration of Artificial Intelligence (AI) into physical robots, enabling them to perceive, reason, learn, and act autonomously rather than just following pre-programmed instructions. By combining AI "brains" with robotic "bodies," these systems process sensor data to navigate, solve problems, and interact with humans and environments.
 """
     return StreamingResponse(
-        streaming_audio_response(sample_text),
+        streaming_audio_response(sample_text, save_response=True, output_audio_bitrate="32k", pace=0.9),
         media_type="audio/mpeg"
     )
 

@@ -36,7 +36,9 @@ async def test_audio_stream_with_jitter():
 async def streaming_audio_response(
     text: str, language_code: str = "en-IN",
     save_response: bool = False,
-    speech_sample_rate: int = 8000
+    output_audio_bitrate: int = "32k",
+    pace: float = 1.0
+    
 ) -> AsyncGenerator[bytes, None]:
     """Stream MP3 audio from Sarvam TTS, yielding each chunk as-is from the API."""
 
@@ -46,12 +48,14 @@ async def streaming_audio_response(
             model="bulbul:v2", send_completion_event=True
         ) as ws:
             await ws.configure(target_language_code=language_code, speaker="anushka" 
-                               , speech_sample_rate=speech_sample_rate
+                            #    , speech_sample_rate=speech_sample_rate
+                            , output_audio_bitrate=output_audio_bitrate,
+                            pace=pace
                                )
             await ws.convert(text)
             await ws.flush()
             if save_response:
-                with open("app/data/audio_out_16Khz.mp3", "wb") as f:
+                with open(f"app/data/audio_out_{output_audio_bitrate}.mp3", "wb") as f:
                     async for message in ws:
                         if isinstance(message, AudioOutput):
                             audio_chunk = base64.b64decode(message.data.audio)
