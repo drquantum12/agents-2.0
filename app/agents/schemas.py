@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import Literal, Optional
 
 MAX_STEPS = 5
 
@@ -82,4 +82,63 @@ class TopicAnalysisSchema(BaseModel):
     suggested_action: Literal['continue_lesson', 'answer_and_continue', 'switch_topic', 'politely_redirect', 'handle_small_talk'] = Field(
         ...,
         description="Suggested action: 'continue_lesson' (proceed with current lesson), 'answer_and_continue' (answer question then continue), 'switch_topic' (exit lesson, go to general mode for new topic), 'politely_redirect' (redirect to current lesson), 'handle_small_talk' (respond to casual conversation warmly), 'repeat_last_message' (repeat what was previously said)"
+    )
+
+
+# ── REIMAGINED ARCHITECTURE SCHEMAS ─────────────────────────────────────────
+
+class PedagogicalReasoningSchema(BaseModel):
+    """Tool schema for the Pedagogical Reasoner node."""
+    teaching_mode: Literal[
+        "prerequisite_repair",
+        "re_analogise",
+        "advance",
+        "thread_resolve",
+        "disengage",
+        "lesson_complete",
+    ] = Field(description="The teaching action to take this turn.")
+    target_concept_id: str = Field(
+        description=(
+            "ID of concept to teach. For prerequisite_repair, this is the "
+            "PREREQUISITE concept, not the one asked about."
+        )
+    )
+    reasoning_trace: str = Field(
+        description="1-2 sentences explaining the choice. Not shown to student."
+    )
+    concept_state_update: Optional[dict] = Field(
+        default=None,
+        description=(
+            "concept_id → new state ('known'|'shaky'|'blocked'). "
+            "Only populate if student answered a question this turn."
+        ),
+    )
+    detected_student_analogy: Optional[str] = Field(
+        default=None,
+        description="If student offered a metaphor of their own, capture it.",
+    )
+    new_open_thread: Optional[str] = Field(
+        default=None,
+        description="Verbatim question the student raised that was not answered.",
+    )
+    curiosity_signal: Optional[str] = Field(
+        default=None,
+        description="Topic the student mentioned unprompted.",
+    )
+    fatigue_delta: float = Field(
+        default=0.0,
+        description="+0.1 if student shows confusion. -0.2 after disengage. 0.0 otherwise.",
+    )
+
+
+class ConceptPathSchema(BaseModel):
+    """Used by lesson_planner to set initial concept path."""
+    concept_ids: list = Field(
+        description=(
+            "Ordered concept IDs from concept graph for this topic. "
+            "3 for Beginner, 4 for Intermediate, 5 for Advanced."
+        )
+    )
+    topic_summary: str = Field(
+        description="1-sentence summary of the overall lesson goal."
     )

@@ -902,9 +902,10 @@ def get_agent():
     return _cached_agent
 
 
-def run_agent(user: dict, query: str, session_id: str):
+def _run_agent_legacy(user: dict, query: str, session_id: str):
     """
-    Run the guided learning agent with proper state persistence.
+    Original guided-learning agent (kept for fallback / A-B comparison).
+    Available at /agent/query-legacy via direct import if needed.
     """
     try:
         logger.info(f"Running agent for user {user.get('_id')} with query: {query}")
@@ -964,3 +965,9 @@ def run_agent(user: dict, query: str, session_id: str):
     except Exception as e:
         logger.error(f"Error running agent: {e}", exc_info=True)
         raise
+
+
+# ── PUBLIC ENTRY POINT — reimagined architecture ─────────────────────────────
+# The router imports run_agent from this module; delegating here means
+# no router changes are required.
+from app.agents.run import run_agent  # noqa: E402  (must be last — avoids circular import)
