@@ -35,8 +35,9 @@ package "FastAPI Application  /api/v1" as FastAPI #FFF9E6 {
     [conversation.py\nCRUD /conversations] as ConvRouter
     [message.py\nPOST|GET /messages] as MsgRouter
     [agent.py\nPOST /agent/query\nPOST /agent/device-voice-assistant] as AgentRouter
-    [device.py\nPOST /devices/online/:id\nPOST /devices/heartbeat/:id\nGET /devices/mine\nGET|PATCH /devices/config\nGET /devices/:id/status\nPOST /devices/:id/unpair\nGET /devices/:id/history\n<size:10>in-memory rate-limit: 5 req / 60 s</size>] as DeviceRouter
+    [device.py\nPOST /devices/online/:id\nPOST /devices/heartbeat/:id\nGET /devices/mine\nGET|PATCH /devices/config\nGET /devices/:id/status\nPOST /devices/:id/unpair\nGET /devices/:id/history\nGET /devices/firmware/download\n<size:10>in-memory rate-limit: 5 req / 60 s</size>] as DeviceRouter
     [notification.py\nGET /notifications\nDELETE /notifications/:id] as NotifRouter
+    [mqtt.py\nPOST /mqtt/publish] as MqttRouter
   }
 
   package "Legacy Endpoints (main.py)" as LegacyEndpoints #FFF3E0 {
@@ -79,6 +80,7 @@ package "Data Layer" as DataLayer #FBE9E7 {
     database "device_config" as DevConfigCol
     database "notifications" as NotifCol
     database "messages\n(future use)" as MsgsCol
+    database "firmware\n(OTA versions)" as FirmwareCol
   }
 
   package "Google Cloud Firestore" as Firestore #FCE4EC {
@@ -96,6 +98,8 @@ package "External Services" as External #F3E5F5 {
   [Google GenAI\ngemini-embedding-001\n(768-dim embeddings)] as EmbedAPI
   [SarvamAI\nSTT: saaras:v2.5\nTTS: bulbul:v2\nTranslate: sarvam-translate:v1] as Sarvam
   [Firebase Auth\n(Google Sign-In token\nverification)] as FirebaseAuth
+  [Google Cloud Storage\nbucket: vijayebhav-firmware\n(firmware .bin files)] as GCS
+  [HiveMQ Cloud\nMQTT Broker\n(device commands)] as HiveMQ
 }
 
 '-------- RELATIONSHIPS --------
@@ -108,6 +112,7 @@ MobileApp --> MsgRouter
 MobileApp --> AgentRouter : text query
 MobileApp --> DeviceRouter
 MobileApp --> NotifRouter
+MobileApp --> MqttRouter
 Device --> AgentRouter : raw WAV
 Device --> LegacyRoutes : raw WAV (legacy)
 
@@ -117,8 +122,9 @@ UserRouter ..> Security
 ConvRouter ..> Security
 MsgRouter ..> Security
 AgentRouter ..> Security
-DeviceRouter ..> Security
+DeviceRouter ..> Security : (heartbeat/online/status/unpair/history/config)
 NotifRouter ..> Security
+MqttRouter ..> Security
 
 ' Router → Controller
 AuthRouter --> AuthCtrl
@@ -128,7 +134,10 @@ MsgRouter --> MsgCtrl
 AgentRouter --> CoreAgent
 DeviceRouter --> DevCtrl
 DeviceRouter --> DeviceCtrl
+DeviceRouter --> FirmwareCol : latest version lookup
+DeviceRouter --> GCS : download firmware .bin
 NotifRouter --> NotifCtrl
+MqttRouter --> HiveMQ : publish(topic, message, qos=0)
 
 ' Auth → Firebase util
 AuthCtrl --> FirebaseUtil : google_auth flow
@@ -143,6 +152,7 @@ DevCtrl --> DevConfigCol
 DeviceCtrl --> DevicesCol
 DeviceCtrl --> DevConfigCol : ownership change
 DeviceCtrl --> NotifCol : transfer notification
+DeviceCtrl --> HiveMQ : unpair cmd\n(devices/:id/commands, qos=1)
 NotifCtrl --> NotifCol
 
 ' Security → DB

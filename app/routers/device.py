@@ -7,6 +7,25 @@ from typing import Optional
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import asyncio
+from bson import Decimal128
+
+
+def _d128_to_float(value):
+    """Convert a bson.Decimal128 to float; pass through other types unchanged."""
+    if isinstance(value, Decimal128):
+        return float(value.to_decimal())
+    return value
+
+
+def _sanitize_doc(doc):
+    """Recursively convert BSON types (e.g. Decimal128) in a MongoDB document to JSON-safe types."""
+    if isinstance(doc, dict):
+        return {k: _sanitize_doc(v) for k, v in doc.items()}
+    if isinstance(doc, list):
+        return [_sanitize_doc(v) for v in doc]
+    if isinstance(doc, Decimal128):
+        return float(doc.to_decimal())
+    return doc
 
 from app.utility.security import get_current_user
 from app.controllers.device_config_controller import DeviceConfigController
@@ -225,9 +244,11 @@ async def get_my_devices(
         .find({"owner_user_id": user["_id"], "ownership_status": "active"})
         .limit(50)
     )
+    sanitized = []
     for d in devices:
         d["device_id"] = d.get("_id", d.get("device_id"))
-    return {"devices": devices}
+        sanitized.append(_sanitize_doc(d))
+    return {"devices": sanitized}
 
 
 @router.get("/config", response_model=DeviceConfigResponse)
@@ -266,7 +287,7 @@ async def get_device_status(
         "is_online": device.get("is_online", False),
         "ownership_status": device.get("ownership_status"),
         "last_seen_at": device.get("last_seen_at"),
-        "firmware_version": device.get("firmware_version"),
+        "firmware_version": _d128_to_float(device.get("firmware_version")),
     }
 
 
@@ -371,7 +392,7 @@ async def download_firmware(background_tasks: BackgroundTasks):
         if not latest_firmware_version:
             raise HTTPException(status_code=404, detail="No firmware versions found")
 
-        blob_name = f"firmware_v{latest_firmware_version['version']}.bin"
+        blob_name = f"firmware_v{_d128_to_float(latest_firmware_version['version'])}.bin"
         blob = bucket.blob(blob_name)
         if not blob.exists():
             raise HTTPException(status_code=404, detail="Firmware not found")

@@ -1,41 +1,27 @@
-from langchain.chat_models import init_chat_model
-from langgraph.graph import StateGraph, MessagesState, START
-from langgraph.checkpoint.mongodb import MongoDBSaver  
-from app.agents.llm import LLM
+import os
+from pymongo import MongoClient
+from langgraph.checkpoint.mongodb import MongoDBSaver
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.checkpoint.base import CheckpointTuple
 
-llm = LLM().get_llm()
+DB_URI = os.getenv("DB_URI", "mongodb+srv://arjuntomar:4mzs8E9gdeLAfw8r@cluster0.w6pyfx8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 
-DB_URI = os.getenv("MONGODB_CONNECTION_STRING")
-checkpointer = MongoDBSaver.from_conn_string(DB_URI)
+USER_ID   = "43f4a7cd-5fef-46e4-9541-cc3d553fa22d"
+SESSION   = f"device_session_id_{USER_ID}"
+
+client      = MongoClient(DB_URI)
+checkpointer = MongoDBSaver(client=client, db_name="neurosattva")
 
 if __name__ == "__main__":
-    def call_model(state: MessagesState):
-        response = llm.invoke(state["messages"])
-        return {"messages": response}
+    # Get the latest snapshot for this thread
+    config = {"configurable": {"thread_id": SESSION}}
+    snapshot = checkpointer.get(config)          # returns latest Checkpoint
 
-    builder = StateGraph(MessagesState)
-    builder.add_node(call_model)
-    builder.add_edge(START, "call_model")
-
-    graph = builder.compile(checkpointer=checkpointer)  
-
-    config = {
-        "configurable": {
-            "thread_id": "1"
-        }
-    }
-
-    for chunk in graph.stream(
-        {"messages": [{"role": "user", "content": "hi! I'm bob"}]},
-        config,  
-        stream_mode="values"
-    ):
-        chunk["messages"][-1].pretty_print()
-
-    for chunk in graph.stream(
-        {"messages": [{"role": "user", "content": "what's my name?"}]},
-        config,  
-        stream_mode="values"
-    ):
-        chunk["messages"][-1].pretty_print()
-    
+    if snapshot is None:
+        print("No checkpoint found for", SESSION)
+    else:
+        messages = snapshot["channel_values"].get("messages", [])
+        print(f"Found {len(messages)} messages:\n")
+        for m in messages:
+            role = "USER" if isinstance(m, HumanMessage) else "AI"
+            print(f"[{role}] {m.content[:300]}\n")

@@ -22,11 +22,14 @@
    - [GET /devices/{device_id}/history](#get-devicesdevice_idhistory)
    - [GET /devices/config](#get-devicesconfig)
    - [PATCH /devices/config](#patch-devicesconfig)
+   - [GET /devices/firmware/download](#get-devicesfirmwaredownload)
 7. [Notifications](#7-notifications)
    - [GET /notifications](#get-notifications)
    - [DELETE /notifications/{notification_id}](#delete-notificationsnotification_id)
-8. [Data Models](#8-data-models)
-9. [Error Responses](#9-error-responses)
+8. [MQTT](#8-mqtt)
+   - [POST /mqtt/publish](#post-mqttpublish)
+9. [Data Models](#9-data-models)
+10. [Error Responses](#10-error-responses)
 
 ---
 
@@ -435,14 +438,14 @@ Called by the IoT device after every successful WiFi connection. Manages device 
 **Request Body:**
 ```json
 {
-  "firmware_version": "1.0.3",
+  "firmware_version": 0.1,
   "hardware_revision": "rev-B"
 }
 ```
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `firmware_version` | string | Yes | Current firmware version string |
+| `firmware_version` | float | Yes | Current firmware version number |
 | `hardware_revision` | string | No | Hardware revision identifier |
 
 **Response `200` — Brand-new device (first claim):**
@@ -489,7 +492,7 @@ Returns all active devices currently owned by the authenticated user.
   "devices": [
     {
       "device_id": "esp32-aabbcc",
-      "firmware_version": "1.0.3",
+      "firmware_version": 0.1,
       "ownership_status": "active",
       "is_online": true,
       "last_seen_at": "2026-03-07T08:00:00Z"
@@ -515,7 +518,7 @@ Returns the online status and ownership info for a specific device. Only the cur
   "is_online": true,
   "ownership_status": "active",
   "last_seen_at": "2026-03-07T08:00:00Z",
-  "firmware_version": "1.0.3"
+  "firmware_version": 0.1
 }
 ```
 
@@ -598,7 +601,7 @@ Partially update the device configuration for the currently authenticated user. 
 
 **Auth:** Required (Bearer token)
 
-**Request Body:**
+**Request Body** (all fields optional):
 ```json
 {
   "learning_mode": "Strict",
@@ -629,6 +632,23 @@ Partially update the device configuration for the currently authenticated user. 
 **Errors:** `400` Invalid field value, `401` Unauthorized
 
 ---
+
+### GET `/devices/firmware/download`
+Downloads the latest firmware binary from Google Cloud Storage. The device calls this endpoint to self-update.
+
+The server resolves the latest version from the `firmware` MongoDB collection (highest `version` value), then streams the corresponding `.bin` file from the `vijayebhav-firmware` GCS bucket as a `FileResponse` (automatically sets `Content-Length`).
+
+**Auth:** Not required — open endpoint intended for IoT devices.
+
+**Response `200`:**
+- `Content-Type: application/octet-stream`
+- `Content-Disposition: attachment; filename="firmware_v<version>.bin"`
+- Binary `.bin` file body
+
+**Errors:**
+- `404` No firmware versions found (empty `firmware` collection)
+- `404` Firmware blob not found in GCS
+- `500` Error downloading firmware (GCS SDK or I/O error)
 
 ## 7. Notifications
 
@@ -693,7 +713,45 @@ Delete a specific notification by its ID. The notification must belong to the au
 
 ---
 
-## 8. Data Models
+## 8. MQTT
+
+**Prefix:** `/api/v1/mqtt`  
+All endpoints require authentication. Used to publish raw command messages to IoT devices over HiveMQ Cloud.
+
+---
+
+### POST `/mqtt/publish`
+Publish a message to an arbitrary MQTT topic. The backend forwards it to the HiveMQ Cloud broker at the specified QoS level.
+
+**Auth:** Required
+
+**Request Body:**
+```json
+{
+  "topic": "devices/esp32-aabbcc/commands",
+  "message": "reboot",
+  "qos": 0
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `topic` | string | Yes | MQTT topic string, e.g. `devices/esp32-aabbcc/commands` |
+| `message` | string | Yes | Raw message payload |
+| `qos` | integer | No | Quality of Service level: `0`, `1`, or `2`. Default: `0` |
+
+**Response `200`:**
+```json
+{ "status": "Message published successfully" }
+```
+
+**Errors:** `401` Unauthorized
+
+> **Note:** The unpair flow also internally publishes the string `"unpair"` to `devices/{device_id}/commands` (QoS 1) via this same HiveMQ client — directly in `POST /devices/{device_id}/unpair`, not through this endpoint.
+
+---
+
+## 9. Data Models
 
 ### User
 | Field | Type | Description |
@@ -730,7 +788,7 @@ Delete a specific notification by its ID. The notification must belong to the au
 | Field | Type | Description |
 |---|---|---|
 | `device_id` | string | Hardware serial / MAC — primary key |
-| `firmware_version` | string \| null | Current firmware version |
+| `firmware_version` | float \| null | Current firmware version |
 | `hardware_revision` | string \| null | Hardware revision identifier |
 | `owner_user_id` | string \| null | Current owner's user ID (`null` = unclaimed) |
 | `ownership_status` | string | `"unclaimed"`, `"active"`, or `"transferring"` |
@@ -777,7 +835,7 @@ Delete a specific notification by its ID. The notification must belong to the au
 
 ---
 
-## 9. Error Responses
+## 10. Error Responses
 
 All errors follow this structure:
 ```json

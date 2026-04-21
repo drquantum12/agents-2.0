@@ -4,8 +4,8 @@ from datetime import datetime
 
 
 class DeviceOnlineRequest(BaseModel):
-    firmware_version: str
-    hardware_revision: Optional[str] = None
+    firmware_version: float = 0.0
+    hardware_revision: Optional[float] = None
 
 
 class OwnershipHistoryEntry(BaseModel):
@@ -24,8 +24,8 @@ class PendingTransfer(BaseModel):
 
 class DeviceModel(BaseModel):
     device_id: str
-    firmware_version: Optional[str] = None
-    hardware_revision: Optional[str] = None
+    firmware_version: Optional[float] = None
+    hardware_revision: Optional[float] = None
     owner_user_id: Optional[str] = None
     ownership_status: str  # "unclaimed" | "active" | "transferring"
     claimed_at: Optional[datetime] = None
