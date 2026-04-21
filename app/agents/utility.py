@@ -24,11 +24,12 @@ async def test_audio_stream():
 
 # testing audio stream with random network jitters
 async def test_audio_stream_with_jitter():
+    # Helper for testing the stream from file
     try:
-        with open("app/data/sample.mp3", "rb") as audio_file:
+        with open("app/data/audio_out_32k.mp3", "rb") as audio_file:
             while chunk := audio_file.read(CHUNK_SIZE_BYTES):
                 yield chunk
-                await asyncio.sleep(random.uniform(3.0, 6.0))  # Simulate 3s to 6s network jitter
+                await asyncio.sleep(0)
     except FileNotFoundError:
         yield b'Audio file not found. Run /raw-voice-assistant or /voice-assistant first.'
         await asyncio.sleep(0)

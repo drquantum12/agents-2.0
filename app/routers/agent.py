@@ -154,6 +154,11 @@ async def device_voice_assistant_test(request: Request):
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no"
     }
+    wav_data = await request.body()
+
+    with open("app/data/input_32bit.wav", "wb") as f:
+            f.write(wav_data)
+            
     return StreamingResponse(
         test_audio_stream_with_jitter(),
         media_type="audio/mpeg",

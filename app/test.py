@@ -1,31 +1,27 @@
 import os
 from pymongo import MongoClient
-from bson import Decimal128
-
-
-def _d128_to_float(value):
-    """Convert a bson.Decimal128 to float; pass through other types unchanged."""
-    if isinstance(value, Decimal128):
-        return float(value.to_decimal())
-    return value
+from langgraph.checkpoint.mongodb import MongoDBSaver
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.checkpoint.base import CheckpointTuple
 
 DB_URI = os.getenv("DB_URI", "mongodb+srv://arjuntomar:4mzs8E9gdeLAfw8r@cluster0.w6pyfx8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 
-mongo_db = MongoClient(DB_URI).get_database("neurosattva")
-    
-if __name__ == "__main__":
-    devices = list(
-        mongo_db["devices"]
-        .find({"owner_user_id": "ptLFqq0N9JTyYL7lkAqhB1YSFj32", "ownership_status": "active"})
-        .limit(50)
-    )
-    for d in devices:
-        d["device_id"] = d.get("_id", d.get("device_id"))
-    print({"devices": devices})
+USER_ID   = "43f4a7cd-5fef-46e4-9541-cc3d553fa22d"
+SESSION   = f"device_session_id_{USER_ID}"
 
-#    firmware = mongo_db["firmware"].find_one(
-#             sort=[("version", -1)],
-#             projection={"version": 1},
-#         )
-   
-#    print(_d128_to_float(firmware["version"]))
+client      = MongoClient(DB_URI)
+checkpointer = MongoDBSaver(client=client, db_name="neurosattva")
+
+if __name__ == "__main__":
+    # Get the latest snapshot for this thread
+    config = {"configurable": {"thread_id": SESSION}}
+    snapshot = checkpointer.get(config)          # returns latest Checkpoint
+
+    if snapshot is None:
+        print("No checkpoint found for", SESSION)
+    else:
+        messages = snapshot["channel_values"].get("messages", [])
+        print(f"Found {len(messages)} messages:\n")
+        for m in messages:
+            role = "USER" if isinstance(m, HumanMessage) else "AI"
+            print(f"[{role}] {m.content[:300]}\n")
