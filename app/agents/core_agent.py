@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
 from typing import TypedDict, Annotated, Literal
 from app.agents.llm import LLM
 from langgraph.checkpoint.mongodb import MongoDBSaver
@@ -190,6 +190,13 @@ checkpointer = MongoDBSaver(
 )
 
 
+def get_recent_history(state: AgentState, n: int = 6) -> list[BaseMessage]:
+    """Returns last n messages from checkpointed state, excluding the current user message."""
+    messages = state.get('messages', [])
+    history = messages[:-1] if messages else []
+    return history[-n:]
+
+
 # ========================================
 # GRAPH NODES
 # ========================================
@@ -234,8 +241,19 @@ def general_answer(state: AgentState) -> dict:
     logger.info(f"Generating general answer for: {query[:60]}...")
 
     try:
-        prompt = GENERAL_ANSWER_PROMPT.format(query=query)
-        response = llm.invoke(prompt)
+        recent_history = get_recent_history(state)
+        system_content = (
+            "You are a friendly, knowledgeable AI tutor answering a student's question.\n\n"
+            "Guidelines:\n"
+            "- Give a clear, accurate, and concise answer (under 60 words since this will be spoken aloud)\n"
+            "- Be warm and conversational\n"
+            "- DO NOT use any special symbols like asterisks, hashtags, dashes, or bullet points\n"
+            "- Write in full, plain sentences only\n"
+            "- Do NOT use the user's name\n"
+            "- NO markdown formatting of any kind"
+        )
+        messages_to_send = [SystemMessage(content=system_content)] + recent_history + [HumanMessage(content=query)]
+        response = llm.invoke(messages_to_send)
 
         return {
             "messages": [AIMessage(content=response.content)],
@@ -261,8 +279,23 @@ def brief_answer_and_offer(state: AgentState) -> dict:
     logger.info(f"Brief answer + offering lesson for: {topic[:60]}...")
 
     try:
-        prompt = BRIEF_ANSWER_PROMPT.format(query=query, topic=topic)
-        response = llm.invoke(prompt)
+        recent_history = get_recent_history(state)
+        system_content = (
+            "You are a friendly AI tutor. The student asked a question that could benefit from a detailed explanation.\n\n"
+            "Your task:\n"
+            "1. Give a brief, high-level answer to their question (2-3 sentences max, under 40 words)\n"
+            "2. Then ask if they would like you to break it down into a detailed lesson with sub-topics\n\n"
+            "Guidelines:\n"
+            "- Keep the brief answer simple and accessible\n"
+            "- The offer should feel natural, not robotic\n"
+            "- DO NOT use any special symbols like asterisks, hashtags, dashes, or bullet points\n"
+            "- Write in full, plain sentences only\n"
+            "- Do NOT use the user's name\n"
+            "- NO markdown formatting"
+        )
+        user_content = f"Question: {query}\nTopic: {topic}"
+        messages_to_send = [SystemMessage(content=system_content)] + recent_history + [HumanMessage(content=user_content)]
+        response = llm.invoke(messages_to_send)
 
         return {
             "messages": [AIMessage(content=response.content)],

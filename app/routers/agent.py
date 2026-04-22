@@ -63,7 +63,9 @@ class QueryRequest(BaseModel):
     query: str
         
 @router.post("/query")
-async def agent(request: QueryRequest, user: User = Depends(get_current_user)):
+async def agent(request: QueryRequest, 
+                user: User = Depends(get_current_user)
+                ):
     session_id = get_or_create_device_session_id(user_id=user["_id"])
     response = await asyncio.to_thread(run_agent, user=user, query=request.query, session_id=session_id)
     return {"response": response}
