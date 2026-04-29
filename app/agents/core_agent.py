@@ -15,10 +15,7 @@ import logging
 import operator
 import re
 import json
-import time
-import threading
 from datetime import date, datetime
-from collections import defaultdict
 
 try:
     from bson import ObjectId
@@ -27,90 +24,10 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# ========================================
-# RATE-LIMIT MITIGATION: RETRY & THROTTLE
-# ========================================
-
-class RetryManager:
-    """Exponential backoff for 429 Resource Exhausted errors."""
-    MAX_RETRIES = 3
-    BASE_DELAY = 2  # seconds
-    MAX_DELAY = 30
-    
-    @staticmethod
-    def invoke_with_backoff(llm_instance, prompt, attempt=0):
-        """Invoke LLM with exponential backoff on 429 errors."""
-        try:
-            response = llm_instance.invoke(prompt)
-            return response
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "429" in error_msg or "resource exhausted" in error_msg:
-                if attempt < RetryManager.MAX_RETRIES:
-                    delay = min(RetryManager.BASE_DELAY * (2 ** attempt), RetryManager.MAX_DELAY)
-                    logger.warning(f"429 encountered, retrying in {delay}s (attempt {attempt + 1}/{RetryManager.MAX_RETRIES})")
-                    time.sleep(delay)
-                    return RetryManager.invoke_with_backoff(llm_instance, prompt, attempt + 1)
-                else:
-                    logger.error(f"Max retries exceeded for 429 error")
-                    raise
-            else:
-                raise
-
-class ThrottleManager:
-    """Per-user request throttling to prevent quota exhaustion."""
-    def __init__(self, max_requests_per_minute=10):
-        self.max_requests = max_requests_per_minute
-        self.user_buckets = defaultdict(lambda: {"count": 0, "reset_time": time.time() + 60})
-        self.lock = threading.Lock()
-    
-    def check_quota(self, user_id: str) -> bool:
-        """Returns True if user is within quota; False if throttled."""
-        with self.lock:
-            bucket = self.user_buckets[user_id]
-            now = time.time()
-            
-            # Reset bucket if minute has passed
-            if now >= bucket["reset_time"]:
-                bucket["count"] = 0
-                bucket["reset_time"] = now + 60
-            
-            bucket["count"] += 1
-            if bucket["count"] > self.max_requests:
-                logger.warning(f"User {user_id} throttled: {bucket['count']}/{self.max_requests} requests")
-                return False
-            return True
-
-class FallbackCache:
-    """Cached fallback responses when quota exhausted."""
-    FALLBACK_RESPONSES = {
-        "lesson_plan": [
-            f"Introduction",
-            f"Core concepts",
-            f"Applications",
-            f"Practice problems",
-        ],
-        "teach_step": "Let me break this down for you step by step. Can you tell me what you already know about this topic?",
-        "general_chat": "That's interesting! Tell me more about that.",
-        "assessment": "Great effort! You're on the right track. What do you think might be another way to approach this?",
-    }
-    
-    @staticmethod
-    def get(response_type: str, context: dict = None):
-        """Get cached fallback response."""
-        if response_type == "lesson_plan":
-            topic = context.get("topic", "") if context else ""
-            plan = FallbackCache.FALLBACK_RESPONSES["lesson_plan"]
-            if topic:
-                return [f"{i+1}. {step} of {topic}" for i, step in enumerate(plan)]
-            return plan
-        return FallbackCache.FALLBACK_RESPONSES.get(response_type, FallbackCache.FALLBACK_RESPONSES["general_chat"])
-
 # Initialize LLM and Vector DB
 llm = LLM().get_llm()
 fast_llm = llm  # For routing, can use a lighter model if available
 vector_db = None  # Lazy-loaded in retrieve_context
-throttle_manager = ThrottleManager(max_requests_per_minute=15)
 
 def get_vector_db():
     """Lazy-load vector DB on first use."""
@@ -464,7 +381,7 @@ Return ONLY valid JSON: {{"intent": "<one of above>", "topic": "<if learning_int
 """
     
     try:
-        response = RetryManager.invoke_with_backoff(fast_llm, classifier_prompt)
+        response = fast_llm.invoke(classifier_prompt)
         result = _extract_json_object(response.content)
         if not result:
             raise ValueError("Classifier did not return valid JSON object")
@@ -627,16 +544,15 @@ TONE RULES:
 """
     
     try:
-        response = RetryManager.invoke_with_backoff(llm, [SystemMessage(content=system_prompt)] + messages)
+        response = llm.invoke([SystemMessage(content=system_prompt)] + messages)
         return {
             "messages": [AIMessage(content=response.content)],
             **reset_state
         }
     except Exception as e:
-        logger.error(f"Error in general_node (429/quota): {e}. Using fallback.")
-        fallback = FallbackCache.get("general_chat")
+        logger.error(f"Error in general_node: {e}")
         return {
-            "messages": [AIMessage(content=fallback)],
+            "messages": [AIMessage(content="I'm here to chat! What's on your mind?")],
             **reset_state
         }
 
@@ -680,71 +596,68 @@ def teacher_node(state: AgentState) -> dict:
 
 
 def _handle_new_topic(state: AgentState, student_profile: dict, active_topic: str, step_context: list, messages: list) -> dict:
-    """Generate lesson plan and teach step 1."""
+    """Generate lesson plan AND teach step 1 in a single LLM call."""
     logger.info(f"New topic: {active_topic}")
     
-    # Generate lesson plan
-    lesson_plan_prompt = f"""
-You are an expert CBSE {student_profile.get('grade', 10)} teacher.
+    context_text = chr(10).join([c.get('explanation', '') for c in step_context]) if step_context else ''
+    interests = ', '.join(student_profile.get('interests', []))
+    grade = student_profile.get('grade', 10)
+    name = student_profile.get('name', 'the student')
+    
+    # Single combined call: plan + teach step 1 together
+    combined_prompt = f"""
+You are {name}'s personal mentor. The student wants to learn: "{active_topic}"
 
-The student wants to learn: "{active_topic}"
+You have two tasks. Do BOTH in one response.
 
-Create a 3 to 5 step lesson plan to teach this from scratch.
-Each step is one clear, teachable concept.
+TASK 1 — Build a 3-5 step lesson plan for CBSE grade {grade} (basics to advanced).
+TASK 2 — Teach step 1 right now: explain clearly, use an analogy from their interests, end with ONE Socratic question. 3-5 sentences, conversational tone.
 
-Return ONLY a JSON array of strings, nothing else:
-["Step 1 description", "Step 2 description", ...]
+CONCEPT CONTEXT (use as ground truth):
+{context_text if context_text else 'Teach from general knowledge.'}
+
+STUDENT INTERESTS (for analogies): {interests if interests else 'general topics'}
+
+Respond in EXACTLY this format — no extra text:
+LESSON_PLAN: ["step 1 desc", "step 2 desc", "step 3 desc"]
+---
+[Your teaching for step 1 here]
 """
     
-    try:
-        response = RetryManager.invoke_with_backoff(llm, lesson_plan_prompt)
-        import json
-        lesson_plan = json.loads(response.content)
-        if len(lesson_plan) < 3:
-            lesson_plan = lesson_plan + [f"Advanced concepts of {active_topic}"] * (3 - len(lesson_plan))
-        lesson_plan = lesson_plan[:5]
-    except Exception as e:
-        logger.warning(f"Could not parse lesson plan (429/quota): {e}. Using fallback.")
-        lesson_plan = FallbackCache.get("lesson_plan", {"topic": active_topic})
-    
-    # Now teach step 1
-    teach_prompt = f"""
-You are {student_profile.get('name', 'the student')}'s personal mentor.
-
-You're starting a lesson on: {active_topic}
-
-LESSON PLAN:
-{chr(10).join([f"{i+1}. {step}" for i, step in enumerate(lesson_plan)])}
-
-CURRENT STEP (1 of {len(lesson_plan)}):
-{lesson_plan[0]}
-
-CONCEPT CONTEXT:
-{chr(10).join([c.get('explanation', '') for c in step_context]) if step_context else 'Learn from the concept'}
-
-STUDENT INTERESTS (for analogies): {', '.join(student_profile.get('interests', []))}
-
-TEACHING RULES:
-1. Explain the concept in your own words, using the context as ground truth.
-2. Create a custom analogy from their interests.
-3. End with ONE Socratic question to check understanding.
-4. Keep it conversational, 3-5 sentences max.
-
-After your response, output on a new line:
-STEP_VERDICT: understood
-"""
+    fallback_plan = [
+        f"Introduction to {active_topic}",
+        f"Core concepts of {active_topic}",
+        f"Applications of {active_topic}",
+    ]
     
     try:
-        response = RetryManager.invoke_with_backoff(llm, teach_prompt)
-        # Extract verdict tag (will be cleaned before showing student)
-        raw_content = response.content
-        if "STEP_VERDICT:" in raw_content:
-            content_part, _ = raw_content.rsplit("STEP_VERDICT:", 1)
-        else:
-            content_part = raw_content
+        response = llm.invoke(combined_prompt)
+        raw = response.content.strip()
+        
+        # Parse LESSON_PLAN line
+        lesson_plan = fallback_plan
+        teaching_content = raw
+        
+        if "LESSON_PLAN:" in raw and "---" in raw:
+            plan_part, _, teaching_content = raw.partition("---")
+            plan_line = plan_part.strip()
+            if "LESSON_PLAN:" in plan_line:
+                json_str = plan_line.split("LESSON_PLAN:", 1)[1].strip()
+                parsed = _extract_json_object(json_str) if not json_str.startswith('[') else None
+                try:
+                    lesson_plan = json.loads(json_str) if json_str.startswith('[') else (parsed or fallback_plan)
+                    if not isinstance(lesson_plan, list) or len(lesson_plan) < 2:
+                        lesson_plan = fallback_plan
+                    lesson_plan = lesson_plan[:5]
+                except Exception:
+                    lesson_plan = fallback_plan
+        
+        teaching_content = teaching_content.strip()
+        if "STEP_VERDICT:" in teaching_content:
+            teaching_content = teaching_content.rsplit("STEP_VERDICT:", 1)[0].strip()
         
         return {
-            "messages": [AIMessage(content=content_part.strip())],
+            "messages": [AIMessage(content=teaching_content)],
             "mode": "teacher",
             "lesson_plan": lesson_plan,
             "current_step": 0,
@@ -752,12 +665,11 @@ STEP_VERDICT: understood
             "pending_topic": None,
         }
     except Exception as e:
-        logger.error(f"Error in new_topic (429/quota): {e}. Using fallback.")
-        fallback = FallbackCache.get("teach_step")
+        logger.error(f"Error in new_topic: {e}")
         return {
-            "messages": [AIMessage(content=fallback)],
+            "messages": [AIMessage(content=f"Let's explore {active_topic} together! What do you already know about it?")],
             "mode": "teacher",
-            "lesson_plan": lesson_plan,
+            "lesson_plan": fallback_plan,
             "current_step": 0,
             "awaiting_lesson_confirmation": False,
             "pending_topic": None,
@@ -766,16 +678,18 @@ STEP_VERDICT: understood
 
 def _handle_continue(state: AgentState, student_profile: dict, active_topic: str, 
                      lesson_plan: list, current_step: int, step_context: list, messages: list) -> dict:
-    """Assess understanding and respond; advance step if understood."""
+    """Assess understanding and respond; advance step if understood. Single LLM call."""
     logger.info(f"Continue lesson: step {current_step + 1}/{len(lesson_plan)}")
     
+    is_last_step = (current_step == len(lesson_plan) - 1)
+    
     teach_prompt = f"""
-You are {student_profile.get('name', 'the student')}'s personal mentor. You're mid-lesson.
+You are {student_profile.get('name', 'the student')}'s personal mentor. You're mid-lesson on "{active_topic}".
 
 LESSON PLAN:
 {chr(10).join([f"{i+1}. {step}" for i, step in enumerate(lesson_plan)])}
 
-CURRENT STEP ({current_step + 1} of {len(lesson_plan)}):
+CURRENT STEP ({current_step + 1} of {len(lesson_plan)}) — IS LAST STEP: {is_last_step}:
 {lesson_plan[current_step]}
 
 CONCEPT CONTEXT:
@@ -786,22 +700,21 @@ STUDENT INTERESTS: {', '.join(student_profile.get('interests', []))}
 The student's last message was their response to your question.
 
 YOUR TASK:
-1. Assess if they understood the current step (understood | partial | not_understood).
-2. If UNDERSTOOD: praise naturally, bridge to next step or conclude if last step.
-3. If PARTIAL/NOT_UNDERSTOOD: re-explain with a different analogy, ask simpler question.
-4. End with ONE Socratic question.
+1. Assess if they understood (understood | partial | not_understood).
+2. If UNDERSTOOD and NOT last step: praise naturally, bridge to next step, end with ONE Socratic question.
+3. If UNDERSTOOD and IS LAST STEP: congratulate warmly (not over the top), recap lesson in 2-3 sentences, ask if they want a recall exercise.
+4. If PARTIAL/NOT_UNDERSTOOD: re-explain with a different analogy, ask simpler question.
 
 Keep it conversational, 3-5 sentences.
 
-At the very end, output a new line with:
+At the very end, output:
 STEP_VERDICT: understood | partial | not_understood
 """
     
     try:
-        response = RetryManager.invoke_with_backoff(llm, teach_prompt)
+        response = llm.invoke(teach_prompt)
         raw_content = response.content
         
-        # Extract verdict
         verdict = "understood"
         if "STEP_VERDICT:" in raw_content:
             content_part, verdict_part = raw_content.rsplit("STEP_VERDICT:", 1)
@@ -809,35 +722,16 @@ STEP_VERDICT: understood | partial | not_understood
         else:
             content_part = raw_content
         
-        # Advance step if understood
         new_step = current_step
         new_mode = "teacher"
         world_model_dirty = False
         
         if verdict == "understood":
             new_step = current_step + 1
-            
-            # Check if lesson complete
             if new_step >= len(lesson_plan):
-                # Wrap up
-                close_prompt = f"""
-The student just completed the last step of the lesson on "{active_topic}".
-Congratulate them naturally (like a friend, not over the top).
-Recap what they learned in 2-3 sentences.
-Ask if they want a quick recall exercise or if they're good.
-Keep it short and warm.
-Student interests: {', '.join(student_profile.get('interests', []))}
-"""
-                try:
-                    close_response = RetryManager.invoke_with_backoff(llm, close_prompt)
-                    content_part = close_response.content
-                except Exception as close_e:
-                    logger.warning(f"Close lesson fallback (429): {close_e}")
-                    content_part = f"Great job completing the lesson on {active_topic}! What would you like to do next?"
-                
                 new_mode = "general"
                 new_step = 0
-                world_model_dirty = True  # Mark mastered concept
+                world_model_dirty = True
         
         return {
             "messages": [AIMessage(content=content_part.strip())],
@@ -846,10 +740,9 @@ Student interests: {', '.join(student_profile.get('interests', []))}
             "world_model_dirty": world_model_dirty,
         }
     except Exception as e:
-        logger.error(f"Error in continue (429/quota): {e}. Using fallback.")
-        fallback = FallbackCache.get("assessment")
+        logger.error(f"Error in continue: {e}")
         return {
-            "messages": [AIMessage(content=fallback)],
+            "messages": [AIMessage(content="Let me know your thoughts on that!")],
         }
 
 
@@ -869,13 +762,13 @@ Keep it light — no pressure.
 """
     
     try:
-        response = RetryManager.invoke_with_backoff(llm, digress_prompt)
+        response = llm.invoke(digress_prompt)
         return {
             "messages": [AIMessage(content=response.content)],
             "pending_resume": True,
         }
     except Exception as e:
-        logger.error(f"Error in digress (429/quota): {e}. Using fallback.")
+        logger.error(f"Error in digress: {e}")
         return {
             "messages": [AIMessage(content=f"Got it! Want to get back to {active_topic}?")],
             "pending_resume": True,
@@ -896,13 +789,13 @@ then re-ask your last Socratic question. Don't restart.
 """
     
     try:
-        response = RetryManager.invoke_with_backoff(llm, resume_prompt)
+        response = llm.invoke(resume_prompt)
         return {
             "messages": [AIMessage(content=response.content)],
             "pending_resume": False,
         }
     except Exception as e:
-        logger.error(f"Error in digress_resume (429/quota): {e}. Using fallback.")
+        logger.error(f"Error in digress_resume: {e}")
         return {
             "messages": [AIMessage(content="Great, let's continue!")],
             "pending_resume": False,
@@ -1018,7 +911,7 @@ def get_agent():
 
 def run_agent(user: dict, query: str, session_id: str) -> str:
     """
-    Run the companion+mentor agent with full state persistence and quota protection.
+    Run the companion+mentor agent with full state persistence.
     
     Args:
         user: User dict with '_id' field
@@ -1027,11 +920,6 @@ def run_agent(user: dict, query: str, session_id: str) -> str:
     """
     try:
         user_id = str(user.get("_id", user.get("id", "unknown_user")))
-        
-        # Check throttle quota
-        if not throttle_manager.check_quota(user_id):
-            logger.warning(f"User {user_id} throttled. Returning cached fallback.")
-            return "I'm a bit overwhelmed right now. Give me a second and try again!"
         
         query_text = (query or "").strip()
         if not query_text:
