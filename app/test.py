@@ -10,18 +10,9 @@ USER_ID   = "43f4a7cd-5fef-46e4-9541-cc3d553fa22d"
 SESSION   = f"device_session_id_{USER_ID}"
 
 client      = MongoClient(DB_URI)
-checkpointer = MongoDBSaver(client=client, db_name="neurosattva")
+# checkpointer = MongoDBSaver(client=client, db_name="neurosattva")
 
 if __name__ == "__main__":
-    # Get the latest snapshot for this thread
-    config = {"configurable": {"thread_id": SESSION}}
-    snapshot = checkpointer.get(config)          # returns latest Checkpoint
-
-    if snapshot is None:
-        print("No checkpoint found for", SESSION)
-    else:
-        messages = snapshot["channel_values"].get("messages", [])
-        print(f"Found {len(messages)} messages:\n")
-        for m in messages:
-            role = "USER" if isinstance(m, HumanMessage) else "AI"
-            print(f"[{role}] {m.content[:300]}\n")
+    db = client["neurosattva"]
+    username = db["users"].find_one({"_id": USER_ID})["name"]
+    print(f"User name: {username}")
