@@ -24,6 +24,36 @@ def _get_vector_db():
     return _vector_db
 
 
+def fetch_for_query(query: str, student_profile: dict) -> list[dict]:
+    """
+    Inline context fetch for a specific query string.
+    Called by teacher_node when a lesson step advances, so the next step
+    has fresh curriculum context before the LLM generates its teaching response.
+    Returns an empty list on failure so the node can degrade gracefully.
+    """
+    try:
+        vdb = _get_vector_db()
+        content, sources = vdb.get_similar_documents(
+            text=query,
+            top_k=3,
+            board=student_profile.get("board", "CBSE"),
+            grade=student_profile.get("grade", 10),
+        )
+        return [
+            {
+                "concept": query,
+                "explanation": content,
+                "analogies": "",
+                "chapter": "",
+                "subject": student_profile.get("subject", "Mathematics"),
+                "doc_id": sources[0] if sources else "",
+            }
+        ]
+    except Exception as exc:
+        logger.error(f"fetch_for_query error: {exc}")
+        return []
+
+
 def retrieve_context(state: AgentState) -> dict:
     """
     Query Milvus for curriculum chunks relevant to the current lesson step.

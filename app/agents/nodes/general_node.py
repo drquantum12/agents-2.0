@@ -50,6 +50,7 @@ def general_node(state: AgentState) -> dict:
             "mode": "general",
             "active_topic": None,
             "lesson_plan": [],
+            "subtopic_status": [],
             "current_step": 0,
             "step_context": [],
             "pending_resume": False,

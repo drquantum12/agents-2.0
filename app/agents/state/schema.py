@@ -23,6 +23,7 @@ class AgentState(TypedDict):
     # ---- teacher-mode lesson state ----
     active_topic: str | None
     lesson_plan: list[str]
+    subtopic_status: list[str]  # parallel to lesson_plan: "pending"|"in_progress"|"completed"
     current_step: int
     step_context: list[dict]
     pending_resume: bool

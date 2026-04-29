@@ -13,7 +13,13 @@ import re
 # ---------------------------------------------------------------------------
 
 YES_PATTERNS = [
-    r"^(yes|yeah|yep|yup|sure|ok(?:ay)?|absolutely|definitely|please|go\s+ahead|let'?s?\s+do\s+it|let'?s?\s+go|sounds?\s+good|why\s+not|of\s+course|i'?d?\s+(?:like|love)\s+(?:that|to))[\s!.]*$",
+    # "yes" optionally followed by one qualifier — catches "yes please", "yes sure", "yes go ahead"
+    r"^yes(?:\s+(?:please|sure|ok(?:ay)?|do|go\s+ahead|definitely|absolutely|why\s+not|of\s+course|let'?s))?[\s!.,]*$",
+    # Stand-alone affirmatives
+    r"^(yeah|yep|yup|sure|ok(?:ay)?|absolutely|definitely|please|go\s+ahead)[\s!.,]*$",
+    # Phrase-form affirmatives
+    r"^(let'?s?\s+do\s+it|let'?s?\s+go|sounds?\s+good|why\s+not|of\s+course|i'?d?\s+(?:like|love)\s+(?:that|to))[\s!.]*$",
+    # Action phrases that imply "yes, teach me"
     r"^(break\s+it\s+down|explain\s+(?:it|in\s+detail)|teach\s+me|tell\s+me\s+more|go\s+ahead|i\s+want\s+to\s+learn)",
     r"^haan$",  # Hindi "yes"
 ]
