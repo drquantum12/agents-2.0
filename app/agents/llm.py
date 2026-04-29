@@ -7,9 +7,9 @@ class LLM:
         self.llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-flash-lite",
             temperature=1,
-            max_output_tokens=8192,
+            max_output_tokens=4096,
             timeout=30,
-            max_retries=2,)
+            max_retries=1,)
         # self.llm = ChatOllama(base_url="http://localhost:11434",
         #           model="llama3.2:latest",
         #           temperature=0)

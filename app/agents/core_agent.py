@@ -1,3 +1,9 @@
+"""
+LangGraph Companion Agent v3
+Companion + Socratic Mentor with dual-mode learning
+Stateful across sessions with MongoDB checkpoint storage and student world model
+"""
+
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
 from typing import TypedDict, Annotated, Literal
@@ -5,929 +11,1004 @@ from app.agents.llm import LLM
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo import MongoClient
 import os
-from app.agents.agent_memory_controller import get_chat_history
-from langchain_core.runnables import RunnableConfig
-from app.agents.prompts import (
-    QUERY_CLASSIFIER_PROMPT,
-    GENERAL_ANSWER_PROMPT,
-    BRIEF_ANSWER_PROMPT,
-    CONFIRMATION_CLASSIFIER_PROMPT,
-    LESSON_PLANNER_PROMPT,
-    TUTOR_EXPLANATION_PROMPT,
-    EVALUATOR_PROMPT,
-    TOPIC_ANALYSIS_PROMPT,
-    LESSON_COMPLETE_PROMPT,
-    SMALL_TALK_PROMPT,
-)
 import logging
 import operator
 import re
-import random
-from app.agents.schemas import (
-    QueryClassificationSchema,
-    ConfirmationSchema,
-    LessonPlanSchema,
-    EvaluationSchema,
-    TopicAnalysisSchema,
-)
 import json
+import time
+import threading
+from datetime import date, datetime
+from collections import defaultdict
 
+try:
+    from bson import ObjectId
+except Exception:  # pragma: no cover
+    ObjectId = None
 
 logger = logging.getLogger(__name__)
 
+# ========================================
+# RATE-LIMIT MITIGATION: RETRY & THROTTLE
+# ========================================
+
+class RetryManager:
+    """Exponential backoff for 429 Resource Exhausted errors."""
+    MAX_RETRIES = 3
+    BASE_DELAY = 2  # seconds
+    MAX_DELAY = 30
+    
+    @staticmethod
+    def invoke_with_backoff(llm_instance, prompt, attempt=0):
+        """Invoke LLM with exponential backoff on 429 errors."""
+        try:
+            response = llm_instance.invoke(prompt)
+            return response
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "429" in error_msg or "resource exhausted" in error_msg:
+                if attempt < RetryManager.MAX_RETRIES:
+                    delay = min(RetryManager.BASE_DELAY * (2 ** attempt), RetryManager.MAX_DELAY)
+                    logger.warning(f"429 encountered, retrying in {delay}s (attempt {attempt + 1}/{RetryManager.MAX_RETRIES})")
+                    time.sleep(delay)
+                    return RetryManager.invoke_with_backoff(llm_instance, prompt, attempt + 1)
+                else:
+                    logger.error(f"Max retries exceeded for 429 error")
+                    raise
+            else:
+                raise
+
+class ThrottleManager:
+    """Per-user request throttling to prevent quota exhaustion."""
+    def __init__(self, max_requests_per_minute=10):
+        self.max_requests = max_requests_per_minute
+        self.user_buckets = defaultdict(lambda: {"count": 0, "reset_time": time.time() + 60})
+        self.lock = threading.Lock()
+    
+    def check_quota(self, user_id: str) -> bool:
+        """Returns True if user is within quota; False if throttled."""
+        with self.lock:
+            bucket = self.user_buckets[user_id]
+            now = time.time()
+            
+            # Reset bucket if minute has passed
+            if now >= bucket["reset_time"]:
+                bucket["count"] = 0
+                bucket["reset_time"] = now + 60
+            
+            bucket["count"] += 1
+            if bucket["count"] > self.max_requests:
+                logger.warning(f"User {user_id} throttled: {bucket['count']}/{self.max_requests} requests")
+                return False
+            return True
+
+class FallbackCache:
+    """Cached fallback responses when quota exhausted."""
+    FALLBACK_RESPONSES = {
+        "lesson_plan": [
+            f"Introduction",
+            f"Core concepts",
+            f"Applications",
+            f"Practice problems",
+        ],
+        "teach_step": "Let me break this down for you step by step. Can you tell me what you already know about this topic?",
+        "general_chat": "That's interesting! Tell me more about that.",
+        "assessment": "Great effort! You're on the right track. What do you think might be another way to approach this?",
+    }
+    
+    @staticmethod
+    def get(response_type: str, context: dict = None):
+        """Get cached fallback response."""
+        if response_type == "lesson_plan":
+            topic = context.get("topic", "") if context else ""
+            plan = FallbackCache.FALLBACK_RESPONSES["lesson_plan"]
+            if topic:
+                return [f"{i+1}. {step} of {topic}" for i, step in enumerate(plan)]
+            return plan
+        return FallbackCache.FALLBACK_RESPONSES.get(response_type, FallbackCache.FALLBACK_RESPONSES["general_chat"])
+
+# Initialize LLM and Vector DB
 llm = LLM().get_llm()
-llm_with_classifier_tool = llm.bind_tools(tools=[QueryClassificationSchema])
-llm_with_confirmation_tool = llm.bind_tools(tools=[ConfirmationSchema])
-llm_with_lesson_tool = llm.bind_tools(tools=[LessonPlanSchema])
-llm_with_eval_tool = llm.bind_tools(tools=[EvaluationSchema])
-llm_with_topic_analysis_tool = llm.bind_tools(tools=[TopicAnalysisSchema])
+fast_llm = llm  # For routing, can use a lighter model if available
+vector_db = None  # Lazy-loaded in retrieve_context
+throttle_manager = ThrottleManager(max_requests_per_minute=15)
 
-MAX_STEPS = 5
+def get_vector_db():
+    """Lazy-load vector DB on first use."""
+    global vector_db
+    if vector_db is None:
+        from app.db_utility.vector_db import VectorDB
+        vector_db = VectorDB()
+    return vector_db
+
+
+def _sanitize_for_checkpoint(value):
+    """Convert Mongo/Python objects into msgpack-safe primitives for LangGraph state."""
+    if ObjectId is not None and isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _sanitize_for_checkpoint(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_checkpoint(v) for v in value]
+    return value
+
+# Setup MongoDB connection
+mongo_client = MongoClient(os.getenv("MONGODB_CONNECTION_STRING"))
+mongo_db = mongo_client["neurosattva"]
+student_memory_collection = mongo_db["student_memory"]
+
+# Setup checkpoint saver
+checkpointer = MongoDBSaver(
+    client=mongo_client,
+    db_name="neurosattva",
+    ttl=60 * 60 * 24 * 30,  # 30 days
+)
 
 # ========================================
-# SMALL TALK FAST PATH (Zero-overhead detection)
+# PATTERN MATCHING FOR RULE-BASED ROUTING
 # ========================================
 
-SMALL_TALK_PATTERNS = [
-    r'^(hi|hello|hey|howdy|sup|yo)\b',
-    r'^(good\s+)?(morning|afternoon|evening|night)',
-    r"how\s+are\s+you",
-    r"how'?s?\s+it\s+going",
-    r"what'?s?\s+up",
-    r"tell\s+me\s+a\s+joke",
-    r'^(bye|goodbye|see\s+you|later|take\s+care)',
-    r'^(thanks|thank\s+you)',
-    r"^i'?m\s+(bored|tired|happy|sad|excited|good|fine|great|ok(?:ay)?)",
-    r'^(haha|lol|lmao)',
-    r'^who\s+are\s+you',
-    r"^what('?s|\s+is)\s+your\s+name",
-    r'^(nice|cool|awesome|great|wow)$',
-    r"^you'?re?\s+(funny|cool|nice|great|awesome)",
-]
-
-# Patterns for detecting repeat/replay requests - fast path before LLM call
-REPEAT_REQUEST_PATTERNS = [
-    r"(couldn'?t|can'?t|could\s+not|did\s+not|didn'?t)\s+(hear|understand|catch|get)",
-    r"(repeat|say\s+(that|it|this)\s+again)",
-    r"(come\s+again|pardon|once\s+more|one\s+more\s+time)",
-    r"what\s+(did|was)\s+you\s+(say|ask)",
-    r"(say|tell|ask)\s+(that|it|me)\s+again",
-    r"(again\s+please|please\s+again|please\s+repeat)",
-    r"^again$",
-    r"(can|could)\s+you\s+(repeat|say\s+(that|it)\s+again)",
-    r"i\s+missed\s+(that|it|what\s+you\s+said)",
-    r"what\s+(question|did\s+you\s+ask)",
-    r"(speak|talk)\s+(louder|up)",
-]
-
-# Patterns for detecting confirmation (yes/no) for lesson offer
 YES_PATTERNS = [
     r"^(yes|yeah|yep|yup|sure|ok(?:ay)?|absolutely|definitely|please|go\s+ahead|let'?s?\s+do\s+it|let'?s?\s+go|sounds?\s+good|why\s+not|of\s+course|i'?d?\s+(?:like|love)\s+(?:that|to))[\s!.]*$",
     r"^(break\s+it\s+down|explain\s+(?:it|in\s+detail)|teach\s+me|tell\s+me\s+more|go\s+ahead|i\s+want\s+to\s+learn)",
+    r"^haan$",  # Hindi "yes"
 ]
 
 NO_PATTERNS = [
     r"^(no|nah|nope|not?\s+(?:really|now|thanks)|i'?m?\s+good|skip|never\s*mind|that'?s?\s+(?:enough|fine|okay|ok))[\s!.]*$",
     r"^(i\s+don'?t\s+(?:want|need)|no\s+thanks?|that'?s?\s+all)[\s!.]*$",
+    r"^nahi$",  # Hindi "no"
+]
+
+STOP_PATTERNS = [
+    r"^(stop|exit|enough|band\s+karo|quit|i'?m?\s+done|that'?s?\s+(?:all|enough)|finish)",
+    r"^(that\s+was\s+enough|no\s+more|no\s+further)",
+]
+
+LEARNING_INTENT_PATTERNS = [
+    r"\b(explain|teach|help me (?:learn|understand)|run me through|walk me through|break it down)\b",
+    r"\b(tell me (?:about|something about)|what is|how does|how do|why does|why do)\b",
+    r"\b(photosynthesis|trigonometry|algebra|chemistry|physics|biology|history|geography)\b",
 ]
 
 
-def is_small_talk(query: str) -> bool:
-    """Fast rule-based detection of small talk queries. Zero LLM cost."""
-    query_lower = query.strip().lower()
-    # Small talk is typically short
-    if len(query_lower.split()) <= 10:
-        for pattern in SMALL_TALK_PATTERNS:
-            if re.search(pattern, query_lower):
-                return True
-    return False
-
-
-def is_repeat_request(query: str) -> bool:
-    """Fast rule-based detection of repeat/replay requests. Zero LLM cost."""
-    query_lower = query.strip().lower()
-    if len(query_lower.split()) <= 15:
-        for pattern in REPEAT_REQUEST_PATTERNS:
-            if re.search(pattern, query_lower):
-                return True
-    return False
-
-
-def is_yes(query: str) -> bool:
-    """Fast detection of affirmative responses."""
-    query_lower = query.strip().lower()
+def is_yes(text: str) -> bool:
+    """Fast pattern-based yes detection."""
+    text_lower = text.strip().lower()
     for pattern in YES_PATTERNS:
-        if re.search(pattern, query_lower):
+        if re.search(pattern, text_lower):
             return True
     return False
 
 
-def is_no(query: str) -> bool:
-    """Fast detection of negative responses."""
-    query_lower = query.strip().lower()
+def is_no(text: str) -> bool:
+    """Fast pattern-based no detection."""
+    text_lower = text.strip().lower()
     for pattern in NO_PATTERNS:
-        if re.search(pattern, query_lower):
+        if re.search(pattern, text_lower):
             return True
     return False
 
 
-def pick_filler_phrase(query: str) -> str:
-    """Pick a short contextual filler phrase based on query type. Zero LLM cost."""
-    if is_repeat_request(query):
-        return random.choice([
-            "Sure, one moment.",
-            "Of course, let me repeat.",
-            "No problem, here it is again.",
-        ])
-    if is_small_talk(query):
-        return random.choice([
-            "Hey!",
-            "Hmm, let me think.",
-        ])
-    # Check if it looks like an answer (short, declarative)
-    word_count = len(query.strip().split())
-    if word_count <= 6:
-        return random.choice([
-            "Hmm, let me check.",
-            "Okay, let me think about that.",
-            "Alright, give me a moment.",
-        ])
-    # Longer input — likely a question or new topic
-    return random.choice([
-        "Interesting, let me think.",
-        "Good question, give me a second.",
-        "Let me think about that.",
-        "Hmm, one moment.",
-    ])
+def is_stop(text: str) -> bool:
+    """Fast pattern-based stop detection."""
+    text_lower = text.strip().lower()
+    for pattern in STOP_PATTERNS:
+        if re.search(pattern, text_lower):
+            return True
+    return False
 
 
-def handle_small_talk(query: str) -> str:
-    """Handle casual conversation with a single fast LLM call. Bypasses entire graph."""
-    prompt = SMALL_TALK_PROMPT.format(query=query)
-    response = llm.invoke(prompt)
-    return response.content
+def is_learning_intent(text: str) -> bool:
+    """Fast pattern-based learning intent detection in general mode."""
+    text_lower = text.strip().lower()
+    for pattern in LEARNING_INTENT_PATTERNS:
+        if re.search(pattern, text_lower):
+            return True
+    return False
+
+
+def extract_topic_from_text(text: str) -> str:
+    """Heuristic topic extraction for fast-path routing."""
+    cleaned = text.strip().strip("?.! ")
+    lowered = cleaned.lower()
+    prefixes = [
+        "tell me something about ",
+        "tell me about ",
+        "explain ",
+        "teach me ",
+        "help me understand ",
+        "what is ",
+        "how does ",
+        "why does ",
+    ]
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            topic = cleaned[len(prefix):].strip()
+            return topic if topic else cleaned
+    return cleaned
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Parse JSON either directly or from a fenced block/substring."""
+    if not text:
+        return None
+    candidate = text.strip()
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+
+    # Extract from markdown code fences or mixed text responses.
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = candidate[start:end + 1]
+        try:
+            return json.loads(snippet)
+        except Exception:
+            return None
+    return None
+
+
+# ========================================
+# AGENT STATE SCHEMA
+# ========================================
 
 class AgentState(TypedDict):
-    """The state of the guided learning agent."""
-    query: str                    # the user's current query
-    user: dict                    # user info
+    """
+    The unified state for the companion+mentor agent.
+    Everything flows through this state and persists via MongoDB checkpointer.
+    """
+    # --- Core conversation ---
     messages: Annotated[list[BaseMessage], operator.add]
-    mode: str                     # "general" or "explanation"
-    topic: str                    # active lesson topic (empty in general mode)
-    lesson_plan: list[str]        # list of subtopic steps
-    lesson_step: int              # current step (1-indexed)
-    last_action: str              # tracks what just happened for routing
-    session_id: str
-    awaiting_lesson_confirmation: bool  # True after brief_answer, waiting for yes/no
-    pending_topic: str            # topic saved from classification, used if user says yes
-    feedback: str                 # evaluator feedback to prepend to next explanation
-    last_explanation: str         # last real lesson explanation (for repeat requests)
-
-# Setup MongoDB checkpointer (for persistence/short-term memory)
-checkpointer = MongoDBSaver(
-    client=MongoClient(os.getenv("MONGODB_CONNECTION_STRING")),
-    db_name="neurosattva"
-)
-
-
-def get_recent_history(state: AgentState, n: int = 6) -> list[BaseMessage]:
-    """Returns last n messages from checkpointed state, excluding the current user message."""
-    messages = state.get('messages', [])
-    history = messages[:-1] if messages else []
-    return history[-n:]
+    
+    # --- Routing (set by intent_router each turn) ---
+    route: str  # "general" | "teacher" | "stop_teacher"
+    sub_intent: str  # teacher mode only: "new_topic", "continue", "step_complete", "digress", "digress_resume", "digress_exit"
+    
+    # --- Mode tracking (persists across turns) ---
+    mode: str  # "general" | "teacher"
+    
+    # --- Teacher mode state ---
+    active_topic: str | None  # the lesson topic
+    lesson_plan: list[str]  # 3-5 step descriptions
+    current_step: int  # 0-indexed
+    step_context: list[dict]  # context chunks from Milvus for current step
+    pending_resume: bool  # waiting for yes/no after digression
+    awaiting_lesson_confirmation: bool  # waiting for yes/no after lesson offer in general mode
+    pending_topic: str | None  # proposed topic while waiting for lesson confirmation
+    
+    # --- Long-term memory (loaded at session start) ---
+    student_profile: dict  # world model: mastered_concepts, struggling_concepts, personality, etc.
+    world_model_dirty: bool  # True if profile needs saving
+    
+    # --- Session metadata ---
+    user_id: str
 
 
 # ========================================
-# GRAPH NODES
+# STUDENT PROFILE MANAGEMENT
 # ========================================
 
-def classify_query(state: AgentState) -> dict:
-    """
-    Entry node for general mode. Classifies query as 'general' or 'explanation'.
-    Uses LLM with QueryClassificationSchema tool.
-    """
-    query = state.get('query', '')
-    logger.info(f"Classifying query: {query[:60]}...")
-
+def load_student_profile(user_id: str) -> dict:
+    """Load or create student's long-term world model."""
     try:
-        prompt = QUERY_CLASSIFIER_PROMPT.format(query=query)
-        response = llm_with_classifier_tool.invoke(prompt)
+        profile = student_memory_collection.find_one({"user_id": user_id})
+        if not profile:
+            # Create default profile
+            profile = {
+                "user_id": user_id,
+                "name": user_id.split("_")[0] if "_" in user_id else user_id,
+                "grade": 10,
+                "board": "CBSE",
+                "subject": "Mathematics",
+                "learning_style": "example-driven",
+                "personality_notes": "",
+                "interests": [],
+                "mastered_concepts": [],
+                "struggling_concepts": [],
+                "session_summaries": [],
+                "total_sessions": 0,
+                "last_active": None,
+            }
+            student_memory_collection.insert_one(profile)
+            logger.info(f"Created new student profile for {user_id}")
+        # Never keep Mongo's internal _id in graph state.
+        profile.pop("_id", None)
+        return _sanitize_for_checkpoint(profile)
+    except Exception as e:
+        logger.error(f"Error loading student profile: {e}")
+        # Return minimal default profile
+        return {
+            "user_id": user_id,
+            "name": user_id,
+            "grade": 10,
+            "board": "CBSE",
+            "learning_style": "example-driven",
+            "interests": [],
+            "mastered_concepts": [],
+            "struggling_concepts": [],
+        }
 
-        if response.tool_calls and len(response.tool_calls) > 0:
-            data = response.tool_calls[0]['args']
-            query_type = data.get('query_type', 'general')
-            topic = data.get('topic', query)
-            logger.info(f"Classification: type={query_type}, topic={topic}")
 
+def save_student_profile(user_id: str, profile: dict):
+    """Save updated student world model to MongoDB."""
+    try:
+        profile_to_save = _sanitize_for_checkpoint(profile)
+        profile_to_save.pop("_id", None)
+        profile_to_save["user_id"] = str(user_id)
+        student_memory_collection.replace_one(
+            {"user_id": user_id},
+            profile_to_save,
+            upsert=True
+        )
+        logger.info(f"Saved student profile for {user_id}")
+    except Exception as e:
+        logger.error(f"Error saving student profile: {e}")
+
+
+# ========================================
+# NODES
+# ========================================
+
+def intent_router(state: AgentState) -> dict:
+    """
+    Entry node that runs every turn. Classifies student's intent.
+    Uses rule-based fast path first, LLM fallback for ambiguous cases.
+    Sets route and sub_intent for downstream nodes.
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return {"route": "general", "sub_intent": ""}
+    
+    last_message = messages[-1]
+    if not isinstance(last_message, HumanMessage):
+        return {"route": "general", "sub_intent": ""}
+    
+    user_input = last_message.content
+    mode = state.get("mode", "general")
+    active_topic = state.get("active_topic")
+    active_topic_text = (active_topic or "").strip()
+    pending_resume = state.get("pending_resume", False)
+    awaiting_lesson_confirmation = state.get("awaiting_lesson_confirmation", False)
+    pending_topic = state.get("pending_topic")
+    
+    logger.info(f"Routing: mode={mode}, pending_resume={pending_resume}, input='{user_input[:50]}'")
+    
+    # --- FAST PATH: Resume handling ---
+    if mode == "teacher" and pending_resume:
+        if is_yes(user_input):
+            logger.info("User confirmed resuming lesson")
+            return {"route": "teacher", "sub_intent": "digress_resume", "pending_resume": False}
+        elif is_no(user_input):
+            logger.info("User declined resuming lesson")
+            return {"route": "stop_teacher", "sub_intent": "digress_exit", "pending_resume": False}
+
+    # --- FAST PATH: General-mode lesson confirmation ---
+    if mode == "general" and awaiting_lesson_confirmation:
+        if is_yes(user_input):
+            chosen_topic = pending_topic or active_topic or "this topic"
+            logger.info(f"User confirmed lesson start for topic: {chosen_topic}")
             return {
-                "last_action": f"classified_{query_type}",
-                "pending_topic": topic,
+                "route": "teacher",
+                "sub_intent": "new_topic",
+                "active_topic": chosen_topic,
+                "awaiting_lesson_confirmation": False,
+            }
+        if is_no(user_input):
+            logger.info("User declined lesson offer")
+            return {
+                "route": "general",
+                "sub_intent": "",
+                "awaiting_lesson_confirmation": False,
+                "pending_topic": None,
             }
 
-        # Fallback: treat as general
-        logger.warning("No tool call in classification, defaulting to general")
-        return {"last_action": "classified_general", "pending_topic": query}
+    # --- FAST PATH: General-mode implicit confirmation ---
+    # If the previous assistant turn offered a lesson and user says yes, start teacher mode.
+    if mode == "general" and is_yes(user_input):
+        previous_ai_messages = [m for m in messages[:-1] if isinstance(m, AIMessage)]
+        last_ai_content = previous_ai_messages[-1].content.lower() if previous_ai_messages else ""
+        offered_lesson_markers = [
+            "want me to run you through",
+            "want me to break",
+            "step by step",
+            "detailed lesson",
+        ]
+        if any(marker in last_ai_content for marker in offered_lesson_markers):
+            inferred_topic = pending_topic or active_topic_text or "this topic"
+            logger.info(f"Implicit confirmation detected, starting teacher mode for: {inferred_topic}")
+            return {
+                "route": "teacher",
+                "sub_intent": "new_topic",
+                "active_topic": inferred_topic,
+                "awaiting_lesson_confirmation": False,
+                "pending_topic": None,
+            }
+    
+    # --- FAST PATH: Stop detection ---
+    if is_stop(user_input):
+        logger.info("User wants to stop lesson")
+        return {"route": "stop_teacher", "sub_intent": ""}
 
-    except Exception as e:
-        logger.error(f"Error in classify_query: {e}")
-        return {"last_action": "classified_general", "pending_topic": query}
+    # --- FAST PATH: Learning intent in general mode ---
+    if mode == "general" and is_learning_intent(user_input):
+        topic = extract_topic_from_text(user_input)
+        logger.info(f"Learning intent fast-path detected, topic={topic}")
+        return {
+            "route": "teacher",
+            "sub_intent": "new_topic",
+            "active_topic": topic,
+            "awaiting_lesson_confirmation": False,
+            "pending_topic": None,
+        }
+    
+    # --- LLM CLASSIFIER (for everything else) ---
+    classifier_prompt = f"""
+You are a classifier for student learning intents.
 
+Current mode: {mode}
+Student message: "{user_input}"
+Active lesson topic: "{active_topic}"
 
-def general_answer(state: AgentState) -> dict:
-    """
-    Answers a general question directly. Single LLM call, no lesson mode.
-    """
-    query = state.get('query', '')
-    logger.info(f"Generating general answer for: {query[:60]}...")
+Classify this as exactly ONE of:
+- general_chat: casual talk, not studying-related
+- learning_intent: wants to learn/understand a new topic
+- lesson_continue: responding within active lesson (answering question, asking on-topic clarification)
+- lesson_digress: off-topic question during active lesson
+- lesson_stop: wants to end current lesson
 
+Return ONLY valid JSON: {{"intent": "<one of above>", "topic": "<if learning_intent, what topic; else empty>"}}
+"""
+    
     try:
-        recent_history = get_recent_history(state)
-        system_content = (
-            "You are a friendly, knowledgeable AI tutor answering a student's question.\n\n"
-            "Guidelines:\n"
-            "- Give a clear, accurate, and concise answer (under 60 words since this will be spoken aloud)\n"
-            "- Be warm and conversational\n"
-            "- DO NOT use any special symbols like asterisks, hashtags, dashes, or bullet points\n"
-            "- Write in full, plain sentences only\n"
-            "- Do NOT use the user's name\n"
-            "- NO markdown formatting of any kind"
-        )
-        messages_to_send = [SystemMessage(content=system_content)] + recent_history + [HumanMessage(content=query)]
-        response = llm.invoke(messages_to_send)
+        response = RetryManager.invoke_with_backoff(fast_llm, classifier_prompt)
+        result = _extract_json_object(response.content)
+        if not result:
+            raise ValueError("Classifier did not return valid JSON object")
+        intent = result.get("intent", "general_chat")
+        topic = result.get("topic", user_input)
+        
+        logger.info(f"Classifier intent: {intent}")
+        
+        # Map classifier output to route + sub_intent
+        if intent == "general_chat":
+            return {"route": "general", "sub_intent": ""}
+        
+        elif intent == "learning_intent":
+            if mode == "teacher" and topic.lower() == active_topic_text.lower():
+                return {"route": "teacher", "sub_intent": "continue"}
+            else:
+                return {"route": "teacher", "sub_intent": "new_topic", "active_topic": topic}
+        
+        elif intent == "lesson_continue":
+            return {"route": "teacher", "sub_intent": "continue"}
+        
+        elif intent == "lesson_digress":
+            return {"route": "teacher", "sub_intent": "digress"}
+        
+        elif intent == "lesson_stop":
+            return {"route": "stop_teacher", "sub_intent": ""}
+        
+    except Exception as e:
+        logger.warning(f"Classifier LLM error: {e}, applying rule fallback")
+        if mode == "general" and is_learning_intent(user_input):
+            topic = extract_topic_from_text(user_input)
+            return {
+                "route": "teacher",
+                "sub_intent": "new_topic",
+                "active_topic": topic,
+                "awaiting_lesson_confirmation": False,
+                "pending_topic": None,
+            }
+    
+    return {"route": "general", "sub_intent": ""}
 
+
+def retrieve_context(state: AgentState) -> dict:
+    """
+    Retrieves concept chunks from Milvus for the current lesson step.
+    Only runs when new_topic or step_complete is detected.
+    """
+    sub_intent = state.get("sub_intent", "")
+    active_topic = state.get("active_topic", "")
+    lesson_plan = state.get("lesson_plan", [])
+    current_step = state.get("current_step", 0)
+    student_profile = state.get("student_profile", {})
+    
+    if sub_intent == "new_topic":
+        query_text = active_topic
+    else:  # step_complete or continue with context refresh
+        if current_step < len(lesson_plan):
+            query_text = lesson_plan[current_step]
+        else:
+            query_text = active_topic
+    
+    logger.info(f"Retrieving context for: {query_text}")
+    
+    try:
+        # Get vector DB instance (lazy-loaded)
+        vdb = get_vector_db()
+        
+        # Query Milvus with curriculum filters
+        board = student_profile.get("board", "CBSE")
+        grade = student_profile.get("grade", 10)
+        
+        content, sources = vdb.get_similar_documents(
+            text=query_text,
+            top_k=3,
+            board=board,
+            grade=grade
+        )
+        
+        # Parse returned content into structured chunks
+        # (Assuming vector_db returns formatted content; adjust parsing as needed)
+        step_context = [
+            {
+                "concept": query_text,
+                "explanation": content,
+                "analogies": "",
+                "chapter": "",
+                "subject": student_profile.get("subject", "Mathematics"),
+                "doc_id": sources[0] if sources else "",
+            }
+        ]
+        
+        logger.info(f"Retrieved {len(step_context)} context chunks")
+        return {"step_context": step_context}
+        
+    except Exception as e:
+        logger.error(f"Error retrieving context: {e}")
+        return {"step_context": []}
+
+
+def general_node(state: AgentState) -> dict:
+    """
+    Generates friendly companion response in general mode.
+    Knows the student well (interests, mastered concepts, personality).
+    """
+    messages = state.get("messages", [])
+    student_profile = state.get("student_profile", {})
+    route = state.get("route", "")
+    
+    logger.info(f"Generating general mode response (route={route})")
+    
+    # If transitioning from teacher mode (stop_teacher), add farewell note
+    farewell_note = ""
+    reset_state = {}
+    if route == "stop_teacher" and state.get("mode") == "teacher":
+        active_topic = state.get("active_topic", "")
+        current_step = state.get("current_step", 0)
+        lesson_plan = state.get("lesson_plan", [])
+        farewell_note = f"(Note: student ended lesson on '{active_topic}' at step {current_step + 1} of {len(lesson_plan)})"
+        reset_state = {
+            "mode": "general",
+            "active_topic": None,
+            "lesson_plan": [],
+            "current_step": 0,
+            "step_context": [],
+            "pending_resume": False,
+        }
+
+    # In general mode, explicitly close lesson-offer flow on decline.
+    if state.get("awaiting_lesson_confirmation") and is_no(messages[-1].content if messages else ""):
+        reset_state.update({
+            "awaiting_lesson_confirmation": False,
+            "pending_topic": None,
+        })
+    
+    # Build rich system prompt
+    recent_sessions = student_profile.get("session_summaries", [])[-3:]
+    recent_mastered = student_profile.get("mastered_concepts", [])[-5:]
+    
+    system_prompt = f"""
+You are {student_profile.get('name', 'my friend')}'s personal companion — a self-aware, warm, slightly witty friend
+who happens to know a lot about everything.
+
+About your friend:
+- Name: {student_profile.get('name', 'them')}
+- Grade: {student_profile.get('grade', 10)}, Board: {student_profile.get('board', 'CBSE')}
+- Interests: {', '.join(student_profile.get('interests', []))}
+- Personality: {student_profile.get('personality_notes', 'friendly and curious')}
+
+What they've learned with you:
+{chr(10).join([c.get('concept', '') for c in recent_mastered]) if recent_mastered else 'Just getting started!'}
+
+{farewell_note}
+
+TONE RULES:
+- Talk like a real friend. Short, natural sentences.
+- Reference their interests casually if relevant.
+- No "As an AI" or "I'm here to help" clichés. Just talk.
+- If they mention a topic they want to learn, gently ask "want me to run you through it?" — but only once.
+- No bullet points. Just plain conversation.
+"""
+    
+    try:
+        response = RetryManager.invoke_with_backoff(llm, [SystemMessage(content=system_prompt)] + messages)
         return {
             "messages": [AIMessage(content=response.content)],
-            "last_action": "general_answered",
-            "mode": "general",
+            **reset_state
         }
     except Exception as e:
-        logger.error(f"Error in general_answer: {e}")
+        logger.error(f"Error in general_node (429/quota): {e}. Using fallback.")
+        fallback = FallbackCache.get("general_chat")
         return {
-            "messages": [AIMessage(content="That's a great question! Let me know if you'd like me to explain further.")],
-            "last_action": "general_answered",
-            "mode": "general",
+            "messages": [AIMessage(content=fallback)],
+            **reset_state
         }
 
 
-def brief_answer_and_offer(state: AgentState) -> dict:
+def teacher_node(state: AgentState) -> dict:
     """
-    Gives a brief answer to an explanation-type query, then asks if user
-    wants a detailed lesson breakdown.
+    Generates Socratic mentor responses in teacher mode.
+    Handles all teaching sub_intents: new_topic, continue, digress, digress_resume, digress_exit.
     """
-    query = state.get('query', '')
-    topic = state.get('pending_topic', query)
-    logger.info(f"Brief answer + offering lesson for: {topic[:60]}...")
+    sub_intent = state.get("sub_intent", "")
+    student_profile = state.get("student_profile", {})
+    active_topic = state.get("active_topic", "")
+    lesson_plan = state.get("lesson_plan", [])
+    current_step = state.get("current_step", 0)
+    step_context = state.get("step_context", [])
+    messages = state.get("messages", [])
+    
+    logger.info(f"Teacher node: sub_intent={sub_intent}, step={current_step}/{len(lesson_plan)}")
+    
+    # --- BRANCH: new_topic ---
+    if sub_intent == "new_topic":
+        return _handle_new_topic(state, student_profile, active_topic, step_context, messages)
+    
+    # --- BRANCH: continue ---
+    elif sub_intent == "continue":
+        return _handle_continue(state, student_profile, active_topic, lesson_plan, current_step, step_context, messages)
+    
+    # --- BRANCH: digress ---
+    elif sub_intent == "digress":
+        return _handle_digress(state, active_topic, current_step, lesson_plan, messages)
+    
+    # --- BRANCH: digress_resume ---
+    elif sub_intent == "digress_resume":
+        return _handle_digress_resume(state, active_topic, current_step, lesson_plan, messages)
+    
+    # --- BRANCH: digress_exit ---
+    elif sub_intent == "digress_exit":
+        return _handle_digress_exit(state)
+    
+    return {"messages": [AIMessage(content="Let me help you with your lesson.")]}
 
+
+def _handle_new_topic(state: AgentState, student_profile: dict, active_topic: str, step_context: list, messages: list) -> dict:
+    """Generate lesson plan and teach step 1."""
+    logger.info(f"New topic: {active_topic}")
+    
+    # Generate lesson plan
+    lesson_plan_prompt = f"""
+You are an expert CBSE {student_profile.get('grade', 10)} teacher.
+
+The student wants to learn: "{active_topic}"
+
+Create a 3 to 5 step lesson plan to teach this from scratch.
+Each step is one clear, teachable concept.
+
+Return ONLY a JSON array of strings, nothing else:
+["Step 1 description", "Step 2 description", ...]
+"""
+    
     try:
-        recent_history = get_recent_history(state)
-        system_content = (
-            "You are a friendly AI tutor. The student asked a question that could benefit from a detailed explanation.\n\n"
-            "Your task:\n"
-            "1. Give a brief, high-level answer to their question (2-3 sentences max, under 40 words)\n"
-            "2. Then ask if they would like you to break it down into a detailed lesson with sub-topics\n\n"
-            "Guidelines:\n"
-            "- Keep the brief answer simple and accessible\n"
-            "- The offer should feel natural, not robotic\n"
-            "- DO NOT use any special symbols like asterisks, hashtags, dashes, or bullet points\n"
-            "- Write in full, plain sentences only\n"
-            "- Do NOT use the user's name\n"
-            "- NO markdown formatting"
-        )
-        user_content = f"Question: {query}\nTopic: {topic}"
-        messages_to_send = [SystemMessage(content=system_content)] + recent_history + [HumanMessage(content=user_content)]
-        response = llm.invoke(messages_to_send)
+        response = RetryManager.invoke_with_backoff(llm, lesson_plan_prompt)
+        import json
+        lesson_plan = json.loads(response.content)
+        if len(lesson_plan) < 3:
+            lesson_plan = lesson_plan + [f"Advanced concepts of {active_topic}"] * (3 - len(lesson_plan))
+        lesson_plan = lesson_plan[:5]
+    except Exception as e:
+        logger.warning(f"Could not parse lesson plan (429/quota): {e}. Using fallback.")
+        lesson_plan = FallbackCache.get("lesson_plan", {"topic": active_topic})
+    
+    # Now teach step 1
+    teach_prompt = f"""
+You are {student_profile.get('name', 'the student')}'s personal mentor.
 
+You're starting a lesson on: {active_topic}
+
+LESSON PLAN:
+{chr(10).join([f"{i+1}. {step}" for i, step in enumerate(lesson_plan)])}
+
+CURRENT STEP (1 of {len(lesson_plan)}):
+{lesson_plan[0]}
+
+CONCEPT CONTEXT:
+{chr(10).join([c.get('explanation', '') for c in step_context]) if step_context else 'Learn from the concept'}
+
+STUDENT INTERESTS (for analogies): {', '.join(student_profile.get('interests', []))}
+
+TEACHING RULES:
+1. Explain the concept in your own words, using the context as ground truth.
+2. Create a custom analogy from their interests.
+3. End with ONE Socratic question to check understanding.
+4. Keep it conversational, 3-5 sentences max.
+
+After your response, output on a new line:
+STEP_VERDICT: understood
+"""
+    
+    try:
+        response = RetryManager.invoke_with_backoff(llm, teach_prompt)
+        # Extract verdict tag (will be cleaned before showing student)
+        raw_content = response.content
+        if "STEP_VERDICT:" in raw_content:
+            content_part, _ = raw_content.rsplit("STEP_VERDICT:", 1)
+        else:
+            content_part = raw_content
+        
+        return {
+            "messages": [AIMessage(content=content_part.strip())],
+            "mode": "teacher",
+            "lesson_plan": lesson_plan,
+            "current_step": 0,
+            "awaiting_lesson_confirmation": False,
+            "pending_topic": None,
+        }
+    except Exception as e:
+        logger.error(f"Error in new_topic (429/quota): {e}. Using fallback.")
+        fallback = FallbackCache.get("teach_step")
+        return {
+            "messages": [AIMessage(content=fallback)],
+            "mode": "teacher",
+            "lesson_plan": lesson_plan,
+            "current_step": 0,
+            "awaiting_lesson_confirmation": False,
+            "pending_topic": None,
+        }
+
+
+def _handle_continue(state: AgentState, student_profile: dict, active_topic: str, 
+                     lesson_plan: list, current_step: int, step_context: list, messages: list) -> dict:
+    """Assess understanding and respond; advance step if understood."""
+    logger.info(f"Continue lesson: step {current_step + 1}/{len(lesson_plan)}")
+    
+    teach_prompt = f"""
+You are {student_profile.get('name', 'the student')}'s personal mentor. You're mid-lesson.
+
+LESSON PLAN:
+{chr(10).join([f"{i+1}. {step}" for i, step in enumerate(lesson_plan)])}
+
+CURRENT STEP ({current_step + 1} of {len(lesson_plan)}):
+{lesson_plan[current_step]}
+
+CONCEPT CONTEXT:
+{chr(10).join([c.get('explanation', '') for c in step_context]) if step_context else 'Proceed with teaching'}
+
+STUDENT INTERESTS: {', '.join(student_profile.get('interests', []))}
+
+The student's last message was their response to your question.
+
+YOUR TASK:
+1. Assess if they understood the current step (understood | partial | not_understood).
+2. If UNDERSTOOD: praise naturally, bridge to next step or conclude if last step.
+3. If PARTIAL/NOT_UNDERSTOOD: re-explain with a different analogy, ask simpler question.
+4. End with ONE Socratic question.
+
+Keep it conversational, 3-5 sentences.
+
+At the very end, output a new line with:
+STEP_VERDICT: understood | partial | not_understood
+"""
+    
+    try:
+        response = RetryManager.invoke_with_backoff(llm, teach_prompt)
+        raw_content = response.content
+        
+        # Extract verdict
+        verdict = "understood"
+        if "STEP_VERDICT:" in raw_content:
+            content_part, verdict_part = raw_content.rsplit("STEP_VERDICT:", 1)
+            verdict = verdict_part.strip().split()[0].lower()
+        else:
+            content_part = raw_content
+        
+        # Advance step if understood
+        new_step = current_step
+        new_mode = "teacher"
+        world_model_dirty = False
+        
+        if verdict == "understood":
+            new_step = current_step + 1
+            
+            # Check if lesson complete
+            if new_step >= len(lesson_plan):
+                # Wrap up
+                close_prompt = f"""
+The student just completed the last step of the lesson on "{active_topic}".
+Congratulate them naturally (like a friend, not over the top).
+Recap what they learned in 2-3 sentences.
+Ask if they want a quick recall exercise or if they're good.
+Keep it short and warm.
+Student interests: {', '.join(student_profile.get('interests', []))}
+"""
+                try:
+                    close_response = RetryManager.invoke_with_backoff(llm, close_prompt)
+                    content_part = close_response.content
+                except Exception as close_e:
+                    logger.warning(f"Close lesson fallback (429): {close_e}")
+                    content_part = f"Great job completing the lesson on {active_topic}! What would you like to do next?"
+                
+                new_mode = "general"
+                new_step = 0
+                world_model_dirty = True  # Mark mastered concept
+        
+        return {
+            "messages": [AIMessage(content=content_part.strip())],
+            "current_step": new_step,
+            "mode": new_mode,
+            "world_model_dirty": world_model_dirty,
+        }
+    except Exception as e:
+        logger.error(f"Error in continue (429/quota): {e}. Using fallback.")
+        fallback = FallbackCache.get("assessment")
+        return {
+            "messages": [AIMessage(content=fallback)],
+        }
+
+
+def _handle_digress(state: AgentState, active_topic: str, current_step: int, 
+                    lesson_plan: list, messages: list) -> dict:
+    """Answer off-topic question, then ask to resume."""
+    logger.info("Handling digression")
+    
+    digress_prompt = f"""
+You are a mentor. You're in the middle of a lesson on "{active_topic}" (step {current_step + 1} of {len(lesson_plan)}).
+The student just asked something unrelated.
+
+Answer briefly (2-4 sentences), as a knowledgeable friend would.
+
+Then, on a new paragraph, gently ask: "Want to get back to {active_topic}?"
+Keep it light — no pressure.
+"""
+    
+    try:
+        response = RetryManager.invoke_with_backoff(llm, digress_prompt)
         return {
             "messages": [AIMessage(content=response.content)],
-            "last_action": "offered_lesson",
-            "awaiting_lesson_confirmation": True,
-            "pending_topic": topic,
-            "mode": "general",
+            "pending_resume": True,
         }
     except Exception as e:
-        logger.error(f"Error in brief_answer_and_offer: {e}")
+        logger.error(f"Error in digress (429/quota): {e}. Using fallback.")
         return {
-            "messages": [AIMessage(content="That's an interesting topic! Would you like me to break it down step by step?")],
-            "last_action": "offered_lesson",
-            "awaiting_lesson_confirmation": True,
-            "pending_topic": topic,
-            "mode": "general",
+            "messages": [AIMessage(content=f"Got it! Want to get back to {active_topic}?")],
+            "pending_resume": True,
         }
 
 
-def handle_lesson_confirmation(state: AgentState) -> dict:
-    """
-    Handles user's yes/no response to the lesson offer.
-    Fast-path regex for obvious single-word responses; LLM fallback for everything else.
-    """
-    query = state.get('query', '')
-    logger.info(f"Handling lesson confirmation: {query}")
+def _handle_digress_resume(state: AgentState, active_topic: str, current_step: int, 
+                           lesson_plan: list, messages: list) -> dict:
+    """Student confirmed resuming; bring them back to lesson."""
+    logger.info("Resuming lesson after digression")
+    
+    resume_prompt = f"""
+Student confirmed they want to continue the lesson on "{active_topic}".
+We were on step {current_step + 1}: "{lesson_plan[current_step]}"
 
-    # Fast path: unambiguous bare responses (zero LLM cost)
-    if is_yes(query):
-        logger.info("User confirmed lesson (fast path) -> entering explanation mode")
-        return {
-            "last_action": "confirmed_lesson",
-            "awaiting_lesson_confirmation": False,
-            "mode": "explanation",
-        }
-    if is_no(query):
-        logger.info("User declined lesson (fast path) -> staying in general mode")
-        msg = AIMessage(content="No problem at all! Feel free to ask me anything else whenever you are ready.")
-        return {
-            "messages": [msg],
-            "last_action": "declined_lesson",
-            "awaiting_lesson_confirmation": False,
-            "pending_topic": "",
-            "mode": "general",
-        }
-
-    # LLM fallback: handles natural language like "yes tell me in more detail",
-    # "sure go ahead", "I'd love that", "not right now", "what is gravity?" etc.
-    logger.info("Ambiguous confirmation — using LLM to classify intent")
-    offer_message = state.get('last_explanation', 'Would you like a detailed lesson on this topic?')
+Warmly bring them back — remind them briefly where they were (one sentence),
+then re-ask your last Socratic question. Don't restart.
+"""
+    
     try:
-        prompt = CONFIRMATION_CLASSIFIER_PROMPT.format(
-            offer_message=offer_message,
-            user_reply=query,
-        )
-        response = llm_with_confirmation_tool.invoke(prompt)
-
-        intent = "new_query"  # safe default
-        if response.tool_calls:
-            intent = response.tool_calls[0]['args'].get('intent', 'new_query')
-
-        logger.info(f"LLM confirmation intent: {intent}")
-
-        if intent == 'yes':
-            return {
-                "last_action": "confirmed_lesson",
-                "awaiting_lesson_confirmation": False,
-                "mode": "explanation",
-            }
-        elif intent == 'no':
-            msg = AIMessage(content="No problem at all! Feel free to ask me anything else whenever you are ready.")
-            return {
-                "messages": [msg],
-                "last_action": "declined_lesson",
-                "awaiting_lesson_confirmation": False,
-                "pending_topic": "",
-                "mode": "general",
-            }
-        else:  # new_query
-            return {
-                "last_action": "ambiguous_confirmation",
-                "awaiting_lesson_confirmation": False,
-                "pending_topic": "",
-                "mode": "general",
-            }
-
+        response = RetryManager.invoke_with_backoff(llm, resume_prompt)
+        return {
+            "messages": [AIMessage(content=response.content)],
+            "pending_resume": False,
+        }
     except Exception as e:
-        logger.error(f"Error in LLM confirmation classifier: {e}")
-        # On error, treat as new query
+        logger.error(f"Error in digress_resume (429/quota): {e}. Using fallback.")
         return {
-            "last_action": "ambiguous_confirmation",
-            "awaiting_lesson_confirmation": False,
-            "pending_topic": "",
-            "mode": "general",
+            "messages": [AIMessage(content="Great, let's continue!")],
+            "pending_resume": False,
         }
 
 
-def plan_lesson(state: AgentState) -> dict:
-    """
-    Generates a structured lesson plan with 3-5 subtopics.
-    """
-    topic = state.get('pending_topic', state.get('query', 'Unknown'))
-    logger.info(f"Planning lesson for topic: {topic}")
-
-    try:
-        prompt = LESSON_PLANNER_PROMPT.format(topic=topic, max_steps=MAX_STEPS)
-        response = llm_with_lesson_tool.invoke(prompt)
-
-        if response.tool_calls and len(response.tool_calls) > 0:
-            data = response.tool_calls[0]['args']
-            refined_topic = data.get('topic', topic)
-            steps = data.get('steps', [])
-
-            # Ensure 3-5 steps
-            if len(steps) < 3:
-                steps = steps + [f"Additional aspect of {refined_topic}"] * (3 - len(steps))
-            steps = steps[:MAX_STEPS]
-
-            logger.info(f"Lesson plan: {len(steps)} subtopics for '{refined_topic}'")
-
-            plan_msg = AIMessage(
-                content=f"Great, I have planned a lesson on {refined_topic} with {len(steps)} sub-topics. Let us dive in!"
-            )
-
-            return {
-                "topic": refined_topic,
-                "lesson_plan": steps,
-                "lesson_step": 1,
-                "last_action": "planned",
-                "messages": [plan_msg],
-                "mode": "explanation",
-                "pending_topic": "",
-            }
-
-        # Fallback
-        logger.warning("No tool call in lesson planning, using fallback")
-        return {
-            "topic": topic,
-            "lesson_plan": [
-                f"Introduction to {topic}",
-                f"Key concepts of {topic}",
-                f"Practical applications of {topic}",
-            ],
-            "lesson_step": 1,
-            "last_action": "planned",
-            "messages": [AIMessage(content=f"Let us explore {topic} together!")],
-            "mode": "explanation",
-            "pending_topic": "",
-        }
-
-    except Exception as e:
-        logger.error(f"Error in plan_lesson: {e}")
-        return {
-            "topic": topic,
-            "lesson_plan": [f"Understanding {topic}"],
-            "lesson_step": 1,
-            "last_action": "planned",
-            "messages": [AIMessage(content=f"Let us learn about {topic}!")],
-            "mode": "explanation",
-        }
-
-
-def generate_explanation(state: AgentState) -> dict:
-    """
-    Explains the current subtopic and asks a follow-up question.
-    """
-    current_step = state.get('lesson_step', 1)
-    lesson_plan = state.get('lesson_plan', [])
-    topic = state.get('topic', 'the topic')
-
-    logger.info(f"Generating explanation for subtopic {current_step}/{len(lesson_plan)}")
-
-    try:
-        step_content = lesson_plan[current_step - 1] if lesson_plan and current_step <= len(lesson_plan) else f"Step {current_step}"
-
-        prompt = TUTOR_EXPLANATION_PROMPT.format(
-            topic=topic,
-            lesson_step=current_step,
-            step_content=step_content,
-            total_steps=len(lesson_plan),
-        )
-
-        response = llm.invoke(prompt)
-        final_content = response.content
-
-        # Prepend evaluator feedback from previous round if it exists
-        previous_feedback = state.get('feedback', '')
-        if previous_feedback:
-            final_content = f"{previous_feedback}\n\n{final_content}"
-            logger.info("Prepended feedback to explanation")
-
-        return {
-            "messages": [AIMessage(content=final_content)],
-            "last_action": "explained",
-            "feedback": "",
-            "last_explanation": final_content,
-        }
-
-    except Exception as e:
-        logger.error(f"Error in generate_explanation: {e}")
-        return {
-            "messages": [AIMessage(content=f"Let me tell you about this part of {topic}. What do you think?")],
-            "last_action": "explained",
-        }
-
-
-def evaluate_response(state: AgentState) -> dict:
-    """
-    Evaluates the user's answer to the follow-up question.
-    - Correct -> praise + move to next subtopic
-    - Incorrect -> appreciate + explain correct answer + move to next subtopic
-    NEVER loops/re-explains. Always advances.
-    """
-    messages = state.get('messages', [])
-    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
-
-    if not user_messages:
-        logger.warning("No user messages to evaluate")
-        return {"last_action": "proceed"}
-
-    latest_user_message = user_messages[-1].content
-    last_agent_question = state.get('last_explanation', '') or "the previous question"
-
-    logger.info(f"Evaluating: {latest_user_message[:50]}...")
-
-    try:
-        prompt = EVALUATOR_PROMPT.format(
-            user_response=latest_user_message,
-            agent_question=last_agent_question,
-            topic=state.get('topic', 'the topic'),
-        )
-
-        response = llm_with_eval_tool.invoke(prompt)
-
-        if response.tool_calls and len(response.tool_calls) > 0:
-            data = response.tool_calls[0]['args']
-            is_correct = data.get('is_correct', True)
-            feedback = data.get('feedback', '')
-
-            logger.info(f"Evaluation: is_correct={is_correct}")
-
-            # ALWAYS proceed to next step
-            current_step = state.get('lesson_step', 1)
-            return {
-                "lesson_step": current_step + 1,
-                "last_action": "proceed",
-                "feedback": feedback,
-            }
-
-        # Fallback: proceed
-        logger.warning("No tool call in evaluation, defaulting to proceed")
-        current_step = state.get('lesson_step', 1)
-        return {
-            "lesson_step": current_step + 1,
-            "last_action": "proceed",
-        }
-
-    except Exception as e:
-        logger.error(f"Error in evaluate_response: {e}")
-        current_step = state.get('lesson_step', 1)
-        return {
-            "lesson_step": current_step + 1,
-            "last_action": "proceed",
-        }
-
-
-def analyze_topic_context(state: AgentState) -> dict:
-    """
-    During explanation mode, analyzes user's message intent.
-    Handles: answer, clarification, new_topic exit, small_talk, repeat.
-    """
-    messages = state.get('messages', [])
-    topic = state.get('topic', '')
-    lesson_step = state.get('lesson_step', 1)
-    lesson_plan = state.get('lesson_plan', [])
-
-    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    ai_messages = [m for m in messages if isinstance(m, AIMessage)]
-
-    if not user_messages or not topic:
-        return {"last_action": "context_analyzed"}
-
-    # Check if the last message is from the user
-    last_message = messages[-1] if messages else None
-    if isinstance(last_message, AIMessage):
-        logger.info("Last message from AI, waiting for user response")
-        return {"last_action": "waiting_for_response"}
-
-    latest_user_query = user_messages[-1].content
-    last_agent_message = state.get('last_explanation', '') or (ai_messages[-1].content if ai_messages else "")
-
-    # FAST PATH: repeat requests
-    if is_repeat_request(latest_user_query):
-        logger.info("Repeat request detected (fast path)")
-        if last_agent_message:
-            prefix = random.choice([
-                "Sure, let me repeat that. ",
-                "No problem, here it is again. ",
-                "Of course, I will say it again. ",
-            ])
-            return {
-                "messages": [AIMessage(content=prefix + last_agent_message)],
-                "last_action": "repeated",
-            }
-        return {
-            "messages": [AIMessage(content="I do not have anything to repeat yet. Let us continue!")],
-            "last_action": "repeated",
-        }
-
-    step_content = lesson_plan[lesson_step - 1] if lesson_plan and lesson_step <= len(lesson_plan) else ""
-
-    logger.info(f"Analyzing topic context: {latest_user_query[:50]}...")
-
-    try:
-        prompt = TOPIC_ANALYSIS_PROMPT.format(
-            current_topic=topic,
-            current_step=lesson_step,
-            total_steps=len(lesson_plan),
-            step_content=step_content,
-            last_agent_message=last_agent_message[:200],
-            user_query=latest_user_query,
-        )
-
-        response = llm_with_topic_analysis_tool.invoke(prompt)
-
-        if response.tool_calls and len(response.tool_calls) > 0:
-            analysis = response.tool_calls[0]['args']
-            intent = analysis.get('intent', 'answer')
-            suggested_action = analysis.get('suggested_action', 'continue_lesson')
-
-            logger.info(f"Topic analysis: intent={intent}, action={suggested_action}")
-
-            if suggested_action == 'switch_topic':
-                # User wants to exit lesson -> reset to general mode
-                logger.info(f"User wants to exit lesson on '{topic}'")
-                progress_msg = AIMessage(
-                    content=f"Sure thing! We covered {lesson_step - 1} out of {len(lesson_plan)} sub-topics on {topic}. What would you like to know about?"
-                )
-                return {
-                    "messages": [progress_msg],
-                    "last_action": "exited_lesson",
-                    "mode": "general",
-                    "topic": "",
-                    "lesson_plan": [],
-                    "lesson_step": 0,
-                    "last_explanation": "",
-                    "feedback": "",
-                }
-
-            elif suggested_action == 'answer_and_continue':
-                # Clarification question -- answer briefly and re-ask
-                logger.info("Clarification question, answering and continuing")
-                answer_prompt = f"""The student asked a clarification during a lesson on '{topic}'.
-Answer briefly (1-2 sentences), then naturally re-ask the question you previously asked.
-
-Clarification: {latest_user_query}
-Your previous message: {last_agent_message[:300]}
-
-Keep under 60 words. No special symbols. Plain text only."""
-                answer_response = llm.invoke(answer_prompt)
-                return {
-                    "messages": [AIMessage(content=answer_response.content)],
-                    "last_action": "answered_question",
-                }
-
-            elif suggested_action == 'politely_redirect':
-                logger.info("Off-topic, redirecting to lesson")
-                redirect_msg = AIMessage(
-                    content=f"Interesting question! Let us finish our lesson on {topic} first though. We are on sub-topic {lesson_step} of {len(lesson_plan)}. Once done, I can help with anything else!"
-                )
-                return {
-                    "messages": [redirect_msg],
-                    "last_action": "redirected",
-                }
-
-            elif suggested_action == 'handle_small_talk':
-                logger.info("Small talk during lesson")
-                small_talk_response = handle_small_talk(latest_user_query)
-                reminder = f" Anyway, we are on sub-topic {lesson_step} of {len(lesson_plan)} in our {topic} lesson. Ready to continue?"
-                return {
-                    "messages": [AIMessage(content=small_talk_response + reminder)],
-                    "last_action": "small_talk_responded",
-                }
-
-            elif suggested_action == 'repeat_last_message':
-                logger.info("Repeat request (LLM detected)")
-                if last_agent_message:
-                    prefix = random.choice(["Sure, let me repeat. ", "No problem. ", "Of course. "])
-                    return {
-                        "messages": [AIMessage(content=prefix + last_agent_message)],
-                        "last_action": "repeated",
-                    }
-                return {
-                    "messages": [AIMessage(content="Let us continue with our lesson!")],
-                    "last_action": "repeated",
-                }
-
-            else:  # continue_lesson
-                logger.info("User answering lesson question -> evaluate")
-                return {"last_action": "context_analyzed"}
-
-        logger.warning("No tool call in topic analysis, defaulting to continue")
-        return {"last_action": "context_analyzed"}
-
-    except Exception as e:
-        logger.error(f"Error in analyze_topic_context: {e}")
-        return {"last_action": "context_analyzed"}
-
-
-def complete_lesson(state: AgentState) -> dict:
-    """
-    Called when all subtopics are covered. Resets to general mode.
-    """
-    topic = state.get('topic', 'this topic')
-    lesson_plan = state.get('lesson_plan', [])
-    total_steps = len(lesson_plan)
-    feedback = state.get('feedback', '')
-
-    logger.info(f"Completing lesson on '{topic}'")
-
-    try:
-        prompt = LESSON_COMPLETE_PROMPT.format(topic=topic, total_steps=total_steps)
-        response = llm.invoke(prompt)
-        completion_content = response.content
-
-        # Prepend final evaluation feedback if present
-        if feedback:
-            completion_content = f"{feedback}\n\n{completion_content}"
-
-        return {
-            "messages": [AIMessage(content=completion_content)],
-            "last_action": "lesson_completed",
-            "mode": "general",
-            "topic": "",
-            "lesson_plan": [],
-            "lesson_step": 0,
-            "last_explanation": "",
-            "feedback": "",
-            "pending_topic": "",
-        }
-
-    except Exception as e:
-        logger.error(f"Error in complete_lesson: {e}")
-        return {
-            "messages": [AIMessage(content=f"Great work completing the lesson on {topic}! Feel free to ask me anything.")],
-            "last_action": "lesson_completed",
-            "mode": "general",
-            "topic": "",
-            "lesson_plan": [],
-            "lesson_step": 0,
-        }
+def _handle_digress_exit(state: AgentState) -> dict:
+    """Student declined resuming; exit lesson gracefully."""
+    logger.info("Student exited lesson after digression")
+    
+    active_topic = state.get("active_topic", "the topic")
+    lesson_plan = state.get("lesson_plan", [])
+    current_step = state.get("current_step", 0)
+    
+    msg = f"No problem! We covered {current_step + 1} of {len(lesson_plan)} steps on {active_topic}. Feel free to ask me anything else!"
+    
+    return {
+        "messages": [AIMessage(content=msg)],
+        "mode": "general",
+        "active_topic": None,
+        "lesson_plan": [],
+        "current_step": 0,
+        "step_context": [],
+        "pending_resume": False,
+        "awaiting_lesson_confirmation": False,
+        "pending_topic": None,
+    }
 
 
 # ========================================
-# ROUTING FUNCTIONS
+# CONDITIONAL ROUTING
 # ========================================
 
-def route_start(state: AgentState) -> Literal["handle_lesson_confirmation", "analyze_topic", "classify_query"]:
-    """
-    Entry router. Decides the first node based on current state.
-    """
-    # If awaiting yes/no for lesson offer
-    if state.get('awaiting_lesson_confirmation'):
-        logger.info("Awaiting lesson confirmation -> handle_lesson_confirmation")
-        return "handle_lesson_confirmation"
-
-    # If in active explanation mode (has topic + lesson plan)
-    topic = state.get('topic', '')
-    lesson_plan = state.get('lesson_plan', [])
-    mode = state.get('mode', 'general')
-
-    if mode == 'explanation' and topic and lesson_plan:
-        logger.info(f"Active lesson on '{topic}' -> analyze_topic")
-        return "analyze_topic"
-
-    # General mode -- classify the query
-    logger.info("General mode -> classify_query")
-    return "classify_query"
+def route_start(state: AgentState) -> str:
+    """Entry router: decide first node based on state."""
+    route = state.get("route", "general")
+    sub_intent = state.get("sub_intent", "")
+    
+    # If routing says retrieve_context is needed
+    if sub_intent in ["new_topic", "step_complete"]:
+        return "retrieve_context"
+    
+    # General or teacher routing
+    if route == "general" or route == "stop_teacher":
+        return "general_node"
+    elif route == "teacher":
+        return "teacher_node"
+    
+    return "general_node"
 
 
-def route_after_classification(state: AgentState) -> Literal["general_answer", "brief_answer_and_offer"]:
-    """Routes after classify_query based on the classification result."""
-    last_action = state.get('last_action', '')
-
-    if last_action == 'classified_explanation':
-        return "brief_answer_and_offer"
-
-    return "general_answer"
+def route_after_retrieve(state: AgentState) -> str:
+    """After retrieve_context, go to teacher_node."""
+    return "teacher_node"
 
 
-def route_after_confirmation(state: AgentState) -> Literal["plan_lesson", "classify_query", "end"]:
-    """Routes after user responds to lesson offer."""
-    last_action = state.get('last_action', '')
-
-    if last_action == 'confirmed_lesson':
-        return "plan_lesson"
-
-    if last_action == 'ambiguous_confirmation':
-        # Treat their response as a new query -- reclassify
-        return "classify_query"
-
-    # declined_lesson -> message already added, end turn
-    return "end"
-
-
-def route_after_topic_analysis(state: AgentState) -> Literal["evaluate_response", "plan_lesson", "classify_query", "end"]:
-    """Routes after analyze_topic in explanation mode."""
-    last_action = state.get('last_action', '')
-
-    if last_action == 'context_analyzed':
-        return "evaluate_response"
-
-    if last_action == 'exited_lesson':
-        # User exited lesson, reclassify their query as a new general query
-        return "classify_query"
-
-    # All other cases (repeated, redirected, small_talk, answered_question, waiting) -> end turn
-    return "end"
-
-
-def route_after_evaluation(state: AgentState) -> Literal["generate_explanation", "complete_lesson"]:
-    """Routes after evaluate_response. Always proceeds -- check if lesson is done."""
-    lesson_step = state.get('lesson_step', 1)
-    lesson_plan = state.get('lesson_plan', [])
-
-    if lesson_step > len(lesson_plan):
-        return "complete_lesson"
-
-    return "generate_explanation"
-
+# ========================================
+# GRAPH CONSTRUCTION
+# ========================================
 
 def build_agent():
-    """Build and compile the LangGraph workflow."""
+    """Build and compile the new LangGraph agent."""
     workflow = StateGraph(AgentState)
-
+    
     # Add nodes
-    workflow.add_node("classify_query", classify_query)
-    workflow.add_node("general_answer", general_answer)
-    workflow.add_node("brief_answer_and_offer", brief_answer_and_offer)
-    workflow.add_node("handle_lesson_confirmation", handle_lesson_confirmation)
-    workflow.add_node("plan_lesson", plan_lesson)
-    workflow.add_node("generate_explanation", generate_explanation)
-    workflow.add_node("analyze_topic", analyze_topic_context)
-    workflow.add_node("evaluate_response", evaluate_response)
-    workflow.add_node("complete_lesson", complete_lesson)
-
-    # START -> route based on current state
+    workflow.add_node("intent_router", intent_router)
+    workflow.add_node("retrieve_context", retrieve_context)
+    workflow.add_node("general_node", general_node)
+    workflow.add_node("teacher_node", teacher_node)
+    
+    # Edges
+    # Always start with intent classification.
+    workflow.add_edge(START, "intent_router")
+    
     workflow.add_conditional_edges(
-        START,
-        route_start,
+        "intent_router",
+        lambda s: "retrieve_context" if s.get("sub_intent") in ["new_topic", "step_complete"] else (
+            "general_node" if s.get("route") == "general" or s.get("route") == "stop_teacher" else "teacher_node"
+        ),
         {
-            "handle_lesson_confirmation": "handle_lesson_confirmation",
-            "analyze_topic": "analyze_topic",
-            "classify_query": "classify_query",
+            "retrieve_context": "retrieve_context",
+            "general_node": "general_node",
+            "teacher_node": "teacher_node",
         }
     )
-
-    # classify_query -> general_answer OR brief_answer_and_offer
-    workflow.add_conditional_edges(
-        "classify_query",
-        route_after_classification,
-        {
-            "general_answer": "general_answer",
-            "brief_answer_and_offer": "brief_answer_and_offer",
-        }
-    )
-
-    # general_answer -> END
-    workflow.add_edge("general_answer", END)
-
-    # brief_answer_and_offer -> END (wait for user yes/no)
-    workflow.add_edge("brief_answer_and_offer", END)
-
-    # handle_lesson_confirmation -> plan_lesson OR classify_query OR END
-    workflow.add_conditional_edges(
-        "handle_lesson_confirmation",
-        route_after_confirmation,
-        {
-            "plan_lesson": "plan_lesson",
-            "classify_query": "classify_query",
-            "end": END,
-        }
-    )
-
-    # plan_lesson -> generate_explanation
-    workflow.add_edge("plan_lesson", "generate_explanation")
-
-    # generate_explanation -> END (wait for user answer)
-    workflow.add_edge("generate_explanation", END)
-
-    # analyze_topic -> evaluate_response OR plan_lesson OR classify_query OR END
-    workflow.add_conditional_edges(
-        "analyze_topic",
-        route_after_topic_analysis,
-        {
-            "evaluate_response": "evaluate_response",
-            "plan_lesson": "plan_lesson",
-            "classify_query": "classify_query",
-            "end": END,
-        }
-    )
-
-    # evaluate_response -> generate_explanation OR complete_lesson
-    workflow.add_conditional_edges(
-        "evaluate_response",
-        route_after_evaluation,
-        {
-            "generate_explanation": "generate_explanation",
-            "complete_lesson": "complete_lesson",
-        }
-    )
-
-    # complete_lesson -> END
-    workflow.add_edge("complete_lesson", END)
-
+    
+    workflow.add_edge("retrieve_context", "teacher_node")
+    workflow.add_edge("general_node", END)
+    workflow.add_edge("teacher_node", END)
+    
     # Compile with checkpointer
     app = workflow.compile(checkpointer=checkpointer)
-
-    logger.info("Agent workflow compiled successfully (v2)")
-
+    logger.info("Agent v3 workflow compiled successfully")
+    
     return app
 
 
 # ========================================
-# CACHED AGENT SINGLETON
+# AGENT SINGLETON & RUN FUNCTION
 # ========================================
 
 _cached_agent = None
 
 
 def get_agent():
-    """Return a cached agent instance. The graph is built once and reused across all requests."""
+    """Get or create the agent singleton."""
     global _cached_agent
     if _cached_agent is None:
         _cached_agent = build_agent()
@@ -935,65 +1016,75 @@ def get_agent():
     return _cached_agent
 
 
-def run_agent(user: dict, query: str, session_id: str):
+def run_agent(user: dict, query: str, session_id: str) -> str:
     """
-    Run the guided learning agent with proper state persistence.
+    Run the companion+mentor agent with full state persistence and quota protection.
+    
+    Args:
+        user: User dict with '_id' field
+        query: User's query/message
+        session_id: Session ID for checkpointer
     """
     try:
-        logger.info(f"Running agent for user {user.get('_id')} with query: {query}")
-
-        config = {
-            "configurable": {
-                "thread_id": session_id
-            }
-        }
-
+        user_id = str(user.get("_id", user.get("id", "unknown_user")))
+        
+        # Check throttle quota
+        if not throttle_manager.check_quota(user_id):
+            logger.warning(f"User {user_id} throttled. Returning cached fallback.")
+            return "I'm a bit overwhelmed right now. Give me a second and try again!"
+        
+        query_text = (query or "").strip()
+        if not query_text:
+            query_text = "hi"
+        logger.info(f"Running agent v3 for user {user_id}: {query[:60]}...")
+        
+        # Load student profile
+        student_profile = load_student_profile(user_id)
+        
+        # Prepare config for MongoDB checkpointer (thread_id = session_id)
+        config = {"configurable": {"thread_id": session_id}}
+        
         agent = get_agent()
-
-        # Check existing session state
-        current_state = agent.get_state(config)
-        has_state = bool(current_state.values)
-        has_active_lesson = has_state and bool(current_state.values.get("topic"))
-        is_awaiting = has_state and current_state.values.get("awaiting_lesson_confirmation", False)
-
-        # FAST PATH: small talk with no active lesson and no pending confirmation
-        if not has_active_lesson and not is_awaiting and is_small_talk(query):
-            logger.info("Small talk (no lesson) -> fast path (1 LLM call)")
-            return handle_small_talk(query)
-
-        if has_state and (has_active_lesson or is_awaiting):
-            logger.info(f"Resuming session -- topic='{current_state.values.get('topic', '')}', awaiting={is_awaiting}")
-            input_state = {
-                "messages": [HumanMessage(content=query)],
-                "query": query,
-                "user": user,
-            }
-        else:
-            logger.info("New session -- initializing state")
-            input_state = {
-                "messages": [HumanMessage(content=query)],
-                "query": query,
-                "user": user,
-                "session_id": session_id,
-                "mode": "general",
-                "topic": "",
-                "lesson_plan": [],
-                "lesson_step": 0,
-                "last_action": "initial",
-                "awaiting_lesson_confirmation": False,
-                "pending_topic": "",
-                "feedback": "",
-                "last_explanation": "",
-            }
-
+        
+        # Initialize input state
+        input_state = {
+            "messages": [HumanMessage(content=query_text)],
+            "user_id": user_id,
+            "student_profile": _sanitize_for_checkpoint(student_profile),
+            "route": "",
+            "sub_intent": "",
+            "mode": "general",
+            "active_topic": None,
+            "lesson_plan": [],
+            "current_step": 0,
+            "step_context": [],
+            "pending_resume": False,
+            "awaiting_lesson_confirmation": False,
+            "pending_topic": None,
+            "world_model_dirty": False,
+        }
+        
+        # Run agent
         result_state = agent.invoke(input_state, config=config)
-
-        ai_messages = [m for m in result_state.get('messages', []) if isinstance(m, AIMessage)]
-        response = ai_messages[-1].content if ai_messages else "I'm here to help you learn!"
-
-        logger.info("Agent completed successfully")
+        
+        # Save profile if dirty
+        if result_state.get("world_model_dirty"):
+            save_student_profile(
+                user_id,
+                _sanitize_for_checkpoint(result_state.get("student_profile", student_profile)),
+            )
+        
+        # Extract response
+        ai_messages = [m for m in result_state.get("messages", []) if isinstance(m, AIMessage)]
+        response = ai_messages[-1].content if ai_messages else "I'm here to help!"
+        
+        # Clean any STEP_VERDICT tags
+        if "STEP_VERDICT:" in response:
+            response = response.rsplit("STEP_VERDICT:", 1)[0].strip()
+        
+        logger.info("Agent invocation completed successfully")
         return response
-
+        
     except Exception as e:
-        logger.error(f"Error running agent: {e}", exc_info=True)
+        logger.error(f"Error running agent v3: {e}", exc_info=True)
         raise
