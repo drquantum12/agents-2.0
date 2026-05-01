@@ -2,13 +2,12 @@ import asyncio
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from app.agents.core_agent import run_agent
+from app.agents import chat
 from app.utility.security import get_current_user, decode_access_token
 from app.models.user import User
 import tempfile
 from app.agents.utility import translate_text, streaming_audio_response, test_audio_stream, test_audio_stream_with_jitter
-from app.agents.agent_memory_controller import get_or_create_device_session_id
-from app.db_utility.mongo_db import mongo_db
+from app.db_utility.mongo_db import mongo_db, get_or_create_device_session_id
 import os, io
 from typing import AsyncGenerator
 import logging
@@ -66,8 +65,8 @@ class QueryRequest(BaseModel):
 async def agent(request: QueryRequest, 
                 user: User = Depends(get_current_user)
                 ):
-    session_id = get_or_create_device_session_id(user_id=user["_id"])
-    response = await asyncio.to_thread(run_agent, user=user, query=request.query, session_id=session_id)
+    session_id, is_new_session = get_or_create_device_session_id(user_id=user["_id"])
+    response = await asyncio.to_thread(chat, user_id=str(user["_id"]), session_id=session_id, query=request.query, is_new_session=is_new_session)
     return {"response": response}
         
 @router.post("/device-voice-assistant")
@@ -131,8 +130,15 @@ async def device_voice_assistant(request: Request,
     # --------------------------
 
     # 3. Get LLM response
-    session_id = get_or_create_device_session_id(user_id=user["_id"])
-    response = await asyncio.to_thread(run_agent, user=user, query=result.transcript, session_id=session_id)
+    session_id, is_new_session = get_or_create_device_session_id(user_id=user["_id"])
+    response = await asyncio.to_thread(chat, user_id=str(user["_id"]),
+                                    session_id=session_id, 
+                                    query=result.transcript,
+                                    is_new_session=is_new_session,
+                                    grade=user.get("grade"),
+                                    board=user.get("board"),
+                                    personalized=user.get("personalized", False)
+                                    )
 
     # 4. Translate back to detected language
     if language_code != "en-IN":
@@ -237,9 +243,9 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
                 continue
 
             # 5. LLM agent response.
-            session_id = get_or_create_device_session_id(user_id=user["_id"])
+            session_id, is_new_session = get_or_create_device_session_id(user_id=user["_id"])
             response = await asyncio.to_thread(
-                run_agent, user=user, query=result.transcript, session_id=session_id
+                chat, user_id=str(user["_id"]), session_id=session_id, query=result.transcript, is_new_session=is_new_session
             )
 
             # 6. Translate back if the user spoke a non-English language.

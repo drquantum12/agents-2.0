@@ -4,11 +4,10 @@ from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi import status
 from fastapi.middleware import cors as middleware
-import tempfile
 from sarvamai import SarvamAI, AsyncSarvamAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
-from app.agents.prompts import AI_TUTOR_PROMPT, AI_DEVICE_TUTOR_PROMPT
+from app.agents import init_agent
 from app.state import state
 from app.utility.hiveMQ import HiveMQClient
 # from db_utility.vector_db import VectorDB 
@@ -35,6 +34,7 @@ async def lifespan(app: FastAPI):
     state.async_sarvam_client = AsyncSarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
     state.sarvam_client = SarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
     state.mqtt_client = HiveMQClient()
+    init_agent(db_name="neurosattva")
     try:
         await state.mqtt_client.connect()
     except Exception as e:
@@ -199,47 +199,6 @@ async def handle_audio_upload(request: Request):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"message": "Internal Server Error during processing"}
         )
-
-@app.post("/voice-assistant")
-async def voice_assistant(file: UploadFile = File(...)):
-    try:
-        audio_data = await file.read()
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".wav") as temp_audio:
-            temp_audio.write(audio_data)
-            temp_audio.flush()
-            result = client.speech_to_text.translate(
-            file=temp_audio,
-            model="saaras:v2.5"
-        )
-        
-        logger.info(f"Translation: {result.transcript}")
-
-        # context, _ = vector_db.get_similar_documents(result.transcript, top_k=3)
-        # logger.info(f"Context retrieved: {context}")
-
-        # prompt = AI_TUTOR_PROMPT.invoke({"query": result.transcript, "context": context})
-        prompt = AI_TUTOR_PROMPT.invoke({"query": result.transcript})
-        response = llm.invoke(prompt).content.strip()
-
-        logger.info(f"LLM response obtained: {response}")
-
-        if result.language_code != "en-IN":
-            response = translate_text(response, source_language_code="en-IN", target_language_code=result.language_code)
-
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-        
-        return StreamingResponse(
-            streaming_audio_response(response, language_code=result.language_code),
-            media_type="audio/mpeg",
-            headers=headers
-        )
-    except Exception as e:
-        logger.error(f"Error in /voice-assistant endpoint: {e}")
-        return {"error": str(e)}
 
 @app.get("/testing-audio-stream")
 async def test_tts_stream(request: Request):
