@@ -21,6 +21,8 @@ Refrain from using symbols in your answers.
     ("user", """
     User's Name: {user_name}
     User Query: {query}
+     
+    Use the following relevant information to answer the user's query if needed: {context_for_llm}
 """
      )
 ])
@@ -40,6 +42,7 @@ Refrain from using symbols in your answers.
     ("user", """
     User's Name: {user_name}
     User Query: {query}
+    Relevant Context: {context_for_llm}
 """
      )
 ])

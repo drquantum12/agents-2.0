@@ -3,6 +3,7 @@ from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, System
 from typing import TypedDict, Annotated, Literal
 from app.agents.llm import LLM
 from langgraph.checkpoint.mongodb import MongoDBSaver
+from app.db_utility.vector_db import VectorDB
 from pymongo import MongoClient
 import os
 from app.agents.agent_memory_controller import get_chat_history
@@ -41,6 +42,8 @@ llm_with_confirmation_tool = llm.bind_tools(tools=[ConfirmationSchema])
 llm_with_lesson_tool = llm.bind_tools(tools=[LessonPlanSchema])
 llm_with_eval_tool = llm.bind_tools(tools=[EvaluationSchema])
 llm_with_topic_analysis_tool = llm.bind_tools(tools=[TopicAnalysisSchema])
+
+vector_db = VectorDB()
 
 MAX_STEPS = 5
 
@@ -182,11 +185,13 @@ class AgentState(TypedDict):
     pending_topic: str            # topic saved from classification, used if user says yes
     feedback: str                 # evaluator feedback to prepend to next explanation
     last_explanation: str         # last real lesson explanation (for repeat requests)
+    context_for_llm: dict                # accumulates relevant context for LLM calls (e.g. retrieved docs)
 
 # Setup MongoDB checkpointer (for persistence/short-term memory)
 checkpointer = MongoDBSaver(
     client=MongoClient(os.getenv("MONGODB_CONNECTION_STRING")),
-    db_name="neurosattva"
+    db_name="neurosattva",
+    ttl= 15 * 24 * 60 * 60,  # 15 days in seconds
 )
 
 
@@ -465,6 +470,7 @@ def generate_explanation(state: AgentState) -> dict:
     current_step = state.get('lesson_step', 1)
     lesson_plan = state.get('lesson_plan', [])
     topic = state.get('topic', 'the topic')
+    content, sources = vector_db.get_similar_documents(topic, top_k=3)  # Retrieve relevant context from vector DB
 
     logger.info(f"Generating explanation for subtopic {current_step}/{len(lesson_plan)}")
 
@@ -476,6 +482,7 @@ def generate_explanation(state: AgentState) -> dict:
             lesson_step=current_step,
             step_content=step_content,
             total_steps=len(lesson_plan),
+            context=content  # Pass the retrieved context to the LLM
         )
 
         response = llm.invoke(prompt)
