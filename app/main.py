@@ -57,7 +57,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.routers import auth, user, conversation, message, agent, device, notification, mqtt
+from app.routers import auth, user, conversation, message, agent, device, notification, mqtt, orders
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(user.router, prefix="/api/v1")
@@ -67,6 +67,7 @@ app.include_router(agent.router, prefix="/api/v1")
 app.include_router(notification.router, prefix="/api/v1")
 app.include_router(device.router, prefix="/api/v1")
 app.include_router(mqtt.router, prefix="/api/v1")
+app.include_router(orders.router, prefix="/api/v1")
 
 
 client = SarvamAI(api_subscription_key=SARVAM_API_KEY)

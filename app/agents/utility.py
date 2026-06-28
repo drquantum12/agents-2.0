@@ -37,7 +37,7 @@ async def test_audio_stream_with_jitter():
 async def streaming_audio_response(
     text: str, language_code: str = "en-IN",
     save_response: bool = False,
-    output_audio_bitrate: int = "32k",
+    output_audio_bitrate: str = "32k",
     pace: float = 1.0
     
 ) -> AsyncGenerator[bytes, None]:

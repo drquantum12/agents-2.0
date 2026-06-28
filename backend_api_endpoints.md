@@ -10,9 +10,16 @@
 
 1. [Authentication](#1-authentication)
 2. [User Profile](#2-user-profile)
+   - [GET /user/me](#get-userme)
+   - [PATCH /user/me](#patch-userme)
+   - [DELETE /user/me](#delete-userme)
 3. [Conversations](#3-conversations)
 4. [Messages](#4-messages)
 5. [Agent (AI Tutor)](#5-agent-ai-tutor)
+   - [POST /agent/query](#post-agentquery)
+   - [POST /agent/device-voice-assistant](#post-agentdevice-voice-assistant)
+   - [WS /agent/device-voice-assistant-ws](#ws-agentdevice-voice-assistant-ws)
+   - [POST /agent/device-voice-assistant-test](#post-agentdevice-voice-assistant-test)
 6. [Devices](#6-devices)
    - [POST /devices/online/{device_id}](#post-devicesonlinedevice_id)
    - [POST /devices/heartbeat/{device_id}](#post-devicesheartbeatdevice_id)
@@ -28,8 +35,15 @@
    - [DELETE /notifications/{notification_id}](#delete-notificationsnotification_id)
 8. [MQTT](#8-mqtt)
    - [POST /mqtt/publish](#post-mqttpublish)
-9. [Data Models](#9-data-models)
-10. [Error Responses](#10-error-responses)
+9. [Orders (Razorpay)](#9-orders-razorpay)
+   - [POST /orders/create](#post-orderscreate)
+   - [POST /orders/verify](#post-ordersverify)
+   - [GET /orders/status/{order_id}](#get-ordersstatusorder_id)
+   - [POST /orders/webhook](#post-orderswebhook)
+   - [GET /orders/get/{email}](#get-ordersgetemail)
+   - [POST /orders/notify-on-new-device](#post-ordersnotify-on-new-device)
+10. [Data Models](#10-data-models)
+11. [Error Responses](#11-error-responses)
 
 ---
 
@@ -370,7 +384,7 @@ Get all messages in a conversation.
 ## 5. Agent (AI Tutor)
 
 **Prefix:** `/api/v1/agent`  
-All endpoints require authentication.
+All endpoints require authentication unless stated otherwise.
 
 The agent is a guided AI tutor powered by Gemini. It maintains per-user session memory and supports both text and voice interaction. It classifies queries, generates lesson plans, evaluates understanding, and adapts its responses accordingly.
 
@@ -378,6 +392,8 @@ The agent is a guided AI tutor powered by Gemini. It maintains per-user session 
 
 ### POST `/agent/query`
 Send a text query to the AI tutor. Returns a text response.
+
+**Auth:** Required
 
 **Request Body:**
 ```json
@@ -400,6 +416,8 @@ Send a text query to the AI tutor. Returns a text response.
 ### POST `/agent/device-voice-assistant`
 Send raw WAV audio to the AI tutor. Transcribes the speech, runs the agent, and streams back a TTS audio response.
 
+**Auth:** Required
+
 **Request:**
 - `Content-Type: audio/wav` (raw binary body)
 - Audio format: 32-bit PCM WAV, 16 kHz, mono
@@ -416,7 +434,43 @@ Connection: keep-alive
 X-Accel-Buffering: no
 ```
 
-> Language is auto-detected from the audio. TTS output language matches the detected source language.
+> Language is auto-detected from the audio. TTS output language matches the detected source language. Supported languages: English, Hindi, Bengali, Gujarati, Kannada, Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu.
+
+---
+
+### WS `/agent/device-voice-assistant-ws`
+WebSocket endpoint for the AI device voice assistant. Designed for embedded/IoT clients that cannot send an `Authorization` header — authentication is done via a query-parameter token.
+
+**Auth:** Token passed as query parameter `?token=<jwt_token>`
+
+**Connection URL:** `ws://<host>/api/v1/agent/device-voice-assistant-ws?token=<jwt_token>`
+
+**Protocol:**
+
+| Direction | Frame Type | Description |
+|---|---|---|
+| Device → Server | Binary | Raw WAV audio bytes |
+| Server → Device | Binary | MP3 audio chunks (streamed as they arrive) |
+| Server → Device | Text `"DONE"` | Response stream finished |
+| Server → Device | Text `"ERROR:<msg>"` | Processing error |
+
+Sending new audio while a response is still streaming cancels the in-flight stream immediately and starts processing the new utterance.
+
+**Close Codes:**
+- `4001` — Invalid or missing token / user not found
+
+---
+
+### POST `/agent/device-voice-assistant-test`
+Development/testing endpoint that returns a simulated MP3 audio stream with randomised network jitter. Accepts a raw body (ignored) and streams back canned audio.
+
+**Auth:** Not required
+
+**Request:** Raw body (any, ignored)
+
+**Response `200`:**
+- `Content-Type: audio/mpeg`
+- Simulated streaming binary audio (MP3)
 
 ---
 
@@ -751,7 +805,258 @@ Publish a message to an arbitrary MQTT topic. The backend forwards it to the Hiv
 
 ---
 
-## 9. Data Models
+## 9. Orders (Razorpay)
+
+**Prefix:** `/api/v1/orders`
+
+> **Note:** The orders router (`app/routers/orders.py`) must be included in `main.py` via `app.include_router(orders.router, prefix="/api/v1")` to activate these endpoints.
+
+Handles product purchases and pre-orders through Razorpay. Orders are stored in the `orders` MongoDB collection.
+
+---
+
+### POST `/orders/create`
+Creates a new Razorpay order and persists it in the database with `status: "pending"`.
+
+**Auth:** Not required
+
+**Request Body:**
+```json
+{
+  "amount": 2500,
+  "product_id": "prod_abc123",
+  "order_type": "preorder",
+  "name": "Jane Doe",
+  "email": "user@example.com",
+  "phone": "9876543210",
+  "house_no": "42B",
+  "locality": "MG Road",
+  "city": "Bengaluru",
+  "state": "Karnataka",
+  "pincode": "560001"
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `amount` | integer | Yes | Amount in INR (converted to paise internally) |
+| `product_id` | string | Yes | Product identifier |
+| `order_type` | string | Yes | `"buy"` or `"preorder"` |
+| `name` | string | Yes | Buyer's full name |
+| `email` | string (email) | Yes | Buyer's email address |
+| `phone` | string | Yes | Buyer's phone number |
+| `house_no` | string | Yes | House/flat number |
+| `locality` | string | Yes | Street / locality name |
+| `city` | string | Yes | City |
+| `state` | string | Yes | State |
+| `pincode` | string | Yes | Postal code |
+
+**Response `200`:**
+```json
+{
+  "order_id": "order_razorpay_abc123",
+  "amount": 999,
+  "currency": "INR"
+}
+```
+
+**Errors:** `500` Razorpay API failure
+
+---
+
+### POST `/orders/verify`
+Verifies the Razorpay payment signature after the client-side checkout completes. Saves the `payment_id` and sets order status to `"processing"`. Does **not** confirm capture — use [`GET /orders/status/{order_id}`](#get-ordersstatusorder_id) to poll for the final `paid` or `failed` status set by the webhook.
+
+**Auth:** Not required
+
+**Request Body:**
+```json
+{
+  "order_id": "order_razorpay_abc123",
+  "payment_id": "pay_xyz789",
+  "signature": "<razorpay_signature>"
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `order_id` | string | Yes | Razorpay order ID returned from `/orders/create` |
+| `payment_id` | string | Yes | Razorpay payment ID from checkout callback |
+| `signature` | string | Yes | HMAC-SHA256 signature from Razorpay checkout callback |
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "status": "processing"
+}
+```
+
+**Errors:** `400` Invalid payment signature
+
+---
+
+### GET `/orders/status/{order_id}`
+Polling endpoint to check the current status of an order. The frontend should call this every 2–3 seconds after `/orders/verify` until status becomes `"paid"` or `"failed"`. The `order` object is only returned when status is terminal (`paid` or `failed`).
+
+**Auth:** Not required
+
+**Path Parameter:** `order_id` — the Razorpay order ID.
+
+**Response `200` (processing):**
+```json
+{
+  "status": "processing",
+  "order": null
+}
+```
+
+**Response `200` (paid):**
+```json
+{
+  "status": "paid",
+  "order": {
+    "razorpay_order_id": "order_razorpay_abc123",
+    "name": "Jane Doe",
+    "email": "user@example.com",
+    "phone": "9876543210",
+    "product_id": "prod_abc123",
+    "amount": 2500,
+    "order_type": "preorder",
+    "status": "paid",
+    "payment_id": "pay_xyz789",
+    "house_no": "42B",
+    "locality": "MG Road",
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "pincode": "560001",
+    "created_at": 1747123456.0,
+    "updated_at": 1747123789.0
+  }
+}
+```
+
+**Response `200` (failed):**
+```json
+{
+  "status": "failed",
+  "order": { "..." }
+}
+```
+
+**Errors:** `404` Order not found
+
+> **Frontend note:** Set a polling timeout of ~2 minutes. If status is still `"processing"` after timeout, show a message to check email or contact support — the webhook may have been delayed.
+
+---
+
+### POST `/orders/webhook`
+Razorpay webhook receiver. Verifies the webhook signature and updates the order status based on the event type.
+
+**Auth:** Not required — validated via `X-Razorpay-Signature` header (HMAC-SHA256)
+
+**Headers:**
+```
+X-Razorpay-Signature: <razorpay_webhook_signature>
+```
+
+**Request Body:** Raw JSON payload from Razorpay (sent by Razorpay servers directly)
+
+**Supported Events:**
+
+| Event | Effect |
+|---|---|
+| `payment.captured` | Sets order `status` → `"paid"`; sends a preorder confirmation email to the user (via Resend) if their account has an email address on record |
+| `payment.failed` | Sets order `status` → `"failed"` |
+| `refund.processed` | Sets order `status` → `"refunded"` |
+
+> **Email on capture:** The `payment.captured` handler fetches the order by `razorpay_order_id` and uses the `email` field stored on the order document directly. It renders the `preorder_confirmation.html` template and sends it via Resend (`RESEND_FROM_EMAIL`, defaults to `no-reply@vijayebhav.com`). Requires `RESEND_API_KEY`.
+
+**Response `200`:**
+```json
+{
+  "success": true
+}
+```
+
+**Errors:** `400` Invalid webhook signature
+
+---
+
+### GET `/orders/get/{email}`
+Returns all orders placed by the given email address.
+
+**Auth:** Not required
+
+**Path Parameter:** `email` — the buyer's email address (URL-encoded).
+
+**Response `200`:**
+```json
+[
+  {
+    "razorpay_order_id": "order_abc123",
+    "email": "user@example.com",
+    "phone": "9876543210",
+    "product_id": "prod_xyz",
+    "amount": 2500,
+    "order_type": "preorder",
+    "status": "paid",
+    "payment_id": "pay_xyz789",
+    "house_no": "42B",
+    "locality": "MG Road",
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "pincode": "560001",
+    "created_at": 1747123456.0,
+    "updated_at": 1747123789.0
+  }
+]
+```
+
+Returns an empty array `[]` if no orders exist for that email.
+
+**Errors:** `422` Invalid path parameter
+
+---
+
+### POST `/orders/notify-on-new-device`
+Registers a user to be notified when a new VijayeBhav device becomes available. Saves the entry in the `potential_customers` MongoDB collection and sends a confirmation email via Resend. If the email is already registered, returns a success response without creating a duplicate.
+
+**Auth:** Not required
+
+**Request Body:**
+```json
+{
+  "name": "Jane Doe",
+  "email": "user@example.com",
+  "city": "Bengaluru",
+  "state": "Karnataka"
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | User's name (used in the notification email) |
+| `email` | string (email) | Yes | Email to notify |
+| `city` | string | No | User's city |
+| `state` | string | No | User's state |
+
+**Response `200` (new registration):**
+```json
+{
+  "success": true
+}
+```
+
+**Response `200` (already registered):**
+```json
+{
+  "success": true,
+  "message": "Already registered for notifications"
+}
+```
+
+**Errors:** `422` Invalid email format
 
 ### User
 | Field | Type | Description |
@@ -833,9 +1138,28 @@ Publish a message to an arbitrary MQTT topic. The backend forwards it to the Hiv
 | `type` | string | `"info"`, `"warn"`, or `"err"` |
 | `created_at` | datetime | Creation timestamp |
 
+### Order
+| Field | Type | Description |
+|---|---|---|
+| `razorpay_order_id` | string | Razorpay-assigned order ID |
+| `email` | string | Buyer's email address |
+| `phone` | string | Buyer's phone number |
+| `product_id` | string | Product identifier |
+| `amount` | integer | Order amount in INR |
+| `order_type` | string | `"buy"` or `"preorder"` |
+| `status` | string | `"pending"`, `"paid"`, `"failed"`, or `"refunded"` |
+| `payment_id` | string \| null | Razorpay payment ID (set after successful payment) |
+| `house_no` | string | House / flat number |
+| `locality` | string | Street / locality |
+| `city` | string | City |
+| `state` | string | State |
+| `pincode` | string | Postal code |
+| `created_at` | float | Unix timestamp of order creation |
+| `updated_at` | float | Unix timestamp of last status update |
+
 ---
 
-## 10. Error Responses
+## 11. Error Responses
 
 All errors follow this structure:
 ```json

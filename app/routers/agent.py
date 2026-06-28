@@ -82,8 +82,8 @@ async def device_voice_assistant(request: Request,
     # 1. Receive user audio 
     wav_data = await request.body()
 
-    with open("app/data/input_32bit.wav", "wb") as f:
-            f.write(wav_data)
+    # with open("app/data/input_32bit.wav", "wb") as f:
+    #         f.write(wav_data)
 
     # return
     # return StreamingResponse(
@@ -149,7 +149,7 @@ async def device_voice_assistant(request: Request,
         )
 
     return StreamingResponse(
-        _cancellable_stream(streaming_audio_response(response, language_code=language_code), cancel_event),
+        _cancellable_stream(streaming_audio_response(response, language_code=language_code, output_audio_bitrate="8k"), cancel_event),
         media_type="audio/mpeg",
         headers=headers,
     )

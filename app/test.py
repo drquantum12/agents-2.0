@@ -1,27 +1,29 @@
+import resend
 import os
-from pymongo import MongoClient
-from langgraph.checkpoint.mongodb import MongoDBSaver
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.checkpoint.base import CheckpointTuple
+from email_engine import preorder_email
 
-DB_URI = os.getenv("DB_URI", "mongodb+srv://arjuntomar:4mzs8E9gdeLAfw8r@cluster0.w6pyfx8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+resend.api_key = os.getenv("RESEND_API_KEY")
 
-USER_ID   = "43f4a7cd-5fef-46e4-9541-cc3d553fa22d"
-SESSION   = f"device_session_id_{USER_ID}"
 
-client      = MongoClient(DB_URI)
-checkpointer = MongoDBSaver(client=client, db_name="neurosattva")
 
 if __name__ == "__main__":
-    # Get the latest snapshot for this thread
-    config = {"configurable": {"thread_id": SESSION}}
-    snapshot = checkpointer.get(config)          # returns latest Checkpoint
+    params: resend.Emails.SendParams = {
+        "from": "support@vijayebhav.com",
+        "to": "arjunsinghtomar03511@gmail.com",
+        "subject": "Your Preorder Confirmation - ORDER123456",
+        "html": preorder_email({
+    "name": "Arjun Singh Tomar",
+    "order_id": "ORDER123456",
+    "address_flat": "184-B-1",
+    "address_street": "KANYA KUBJA NAGAR",
+    "address_city": "Indore",
+    "address_pin": "452006",
+    "address_state": "Madhya Pradesh",
+}),
+    }
 
-    if snapshot is None:
-        print("No checkpoint found for", SESSION)
-    else:
-        messages = snapshot["channel_values"].get("messages", [])
-        print(f"Found {len(messages)} messages:\n")
-        for m in messages:
-            role = "USER" if isinstance(m, HumanMessage) else "AI"
-            print(f"[{role}] {m.content[:300]}\n")
+    try:
+        response = resend.Emails.send(params)
+        print("Email sent successfully:", response)
+    except Exception as e:
+        print("Error sending email:", e)
