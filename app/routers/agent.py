@@ -8,8 +8,9 @@ from app.models.user import User
 import tempfile
 from app.agents.utility import translate_text, streaming_audio_response, test_audio_stream, test_audio_stream_with_jitter
 from app.db_utility.mongo_db import mongo_db, get_or_create_device_session_id
+from app.utility.security import ENABLE_AUTH, _DEV_STUB_USER
 import os, io
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Callable, Optional
 import logging
 from app.state import state
 
@@ -173,6 +174,41 @@ async def device_voice_assistant_test(request: Request):
         headers=headers
     )
 
+@router.websocket("/device-voice-assistant-ws-test")
+async def device_voice_assistant_ws_test(websocket: WebSocket):
+    """
+    WebSocket test endpoint — no auth, no STT/LLM/TTS calls.
+
+    Protocol:
+      Device → Server : binary frame — raw audio bytes (ignored, just consumed)
+      Server → Device : binary frames — chunks of app/data/sample.mp3 streamed back
+      Server → Device : text "DONE" — finished streaming the test audio
+
+    Lets a device test its WebSocket audio streaming pipeline against a
+    canned response without touching any real STT/LLM/TTS services.
+    """
+    await websocket.accept()
+    logger.info("[WS-TEST] Device connected")
+
+    try:
+        while True:
+            await websocket.receive_bytes()
+
+            async for chunk in test_audio_stream():
+                await websocket.send_bytes(chunk)
+
+            await websocket.send_text("DONE")
+
+    except WebSocketDisconnect:
+        logger.info("[WS-TEST] Device disconnected")
+    except Exception as e:
+        logger.error(f"[WS-TEST] Unexpected error: {e}")
+        try:
+            await websocket.send_text(f"ERROR:{e}")
+        except Exception:
+            pass
+
+
 @router.websocket("/device-voice-assistant-ws")
 async def device_voice_assistant_ws(websocket: WebSocket, token: str):
     """
@@ -189,23 +225,47 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
     """
     # 1. Authenticate via query-param token (WebSocket upgrade cannot send
     #    an Authorization header from most embedded/IoT clients).
-    payload = decode_access_token(token)
-    if payload is None:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
+    #    When ENABLE_AUTH=false (local dev), skip validation and use the
+    #    same stub user that HTTP endpoints receive via get_current_user.
+    if not ENABLE_AUTH:
+        user = _DEV_STUB_USER
+        user_id: str = user["_id"]
+    else:
+        payload = decode_access_token(token)
+        if payload is None:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
 
-    user_id: str = payload.get("sub", "")
-    if not user_id:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
+        user_id = payload.get("sub", "")
+        if not user_id:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
 
-    user = await asyncio.to_thread(mongo_db["users"].find_one, {"_id": user_id})
-    if not user:
-        await websocket.close(code=4001, reason="User not found")
-        return
+        user = await asyncio.to_thread(mongo_db["users"].find_one, {"_id": user_id})
+        if not user:
+            await websocket.close(code=4001, reason="User not found")
+            return
 
     await websocket.accept()
     logger.info(f"[WS] Device connected: {user_id}")
+
+    # Build a thread-safe signal callback.
+    # The ReAct agent tools (signal_device_state, search_web, rag_tool) call
+    # this from within the sync thread started by asyncio.to_thread().
+    # asyncio.run_coroutine_threadsafe posts the send coroutine onto the event
+    # loop and blocks the worker thread briefly until the send completes.
+    _loop = asyncio.get_event_loop()
+
+    def _make_signal_fn(ws: WebSocket, loop: asyncio.AbstractEventLoop) -> Callable[[str], None]:
+        def signal_fn(json_msg: str) -> None:
+            fut = asyncio.run_coroutine_threadsafe(ws.send_text(json_msg), loop)
+            try:
+                fut.result(timeout=5.0)
+            except Exception as sig_exc:
+                logger.warning("[WS] signal_fn send failed: %s", sig_exc)
+        return signal_fn
+
+    signal_fn = _make_signal_fn(websocket, _loop)
 
     cancel_event: asyncio.Event | None = None
 
@@ -220,7 +280,18 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
             cancel_event = asyncio.Event()
             _active_cancel_events[user_id] = cancel_event
 
-            # 4. Speech-to-text + language detection.
+            # 4. (Test mode) Skip STT/LLM entirely — stream pre-baked MP3 test audio.
+            # if not ENABLE_AUTH:
+            #     logger.info("[WS] Test mode: skipping STT/LLM, streaming test audio")
+            #     async for chunk in test_audio_stream():
+            #         if cancel_event.is_set():
+            #             break
+            #         await websocket.send_bytes(chunk)
+            #     if not cancel_event.is_set():
+            #         await websocket.send_text("DONE")
+            #     continue
+
+            # 3. Speech-to-text + language detection.
             result = await asyncio.to_thread(
                 lambda: state.sarvam_client.speech_to_text.translate(
                     file=wav_data,
@@ -230,10 +301,16 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
 
             language_code = result.language_code if result.language_code else ""
 
+            logger.info(
+                "[WS] STT → language: '%s' | transcript: '%s'",
+                language_code,
+                (result.transcript or "")[:120],
+            )
+
             if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
                 logger.warning(f"[WS] Unsupported language: '{language_code}'")
                 async for chunk in streaming_audio_response(
-                    UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN"
+                    UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN", output_audio_bitrate="32k"
                 ):
                     if cancel_event.is_set():
                         break
@@ -242,11 +319,34 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
                     await websocket.send_text("DONE")
                 continue
 
-            # 5. LLM agent response.
+            # 4. Send immediate "thinking" signal so the device shows the
+            #    neural-pulse animation with zero latency while STT just
+            #    finished. The ReAct agent will then emit "searching" or
+            #    "asking" signals autonomously via signal_device_state tool.
+            await websocket.send_text('{"type":"agent_state","value":"thinking"}')
+
+            # 5. LLM ReAct agent response.
+            #    signal_fn is passed in so agent tools can push WS frames from
+            #    inside the sync thread (e.g. "searching" before a Milvus call).
             session_id, is_new_session = get_or_create_device_session_id(user_id=user["_id"])
             response = await asyncio.to_thread(
-                chat, user_id=str(user["_id"]), session_id=session_id, query=result.transcript, is_new_session=is_new_session
+                chat,
+                user_id=str(user["_id"]),
+                session_id=session_id,
+                query=result.transcript,
+                is_new_session=is_new_session,
+                grade=user.get("grade"),
+                board=user.get("board"),
+                personalized=user.get("personalized", False),
+                signal_fn=signal_fn,
             )
+
+            # logger.info(
+            #     "[WS] STT transcript: '%s' | Agent response (%d chars): '%s'",
+            #     (result.transcript or "")[:80],
+            #     len(response),
+            #     response[:120],
+            # )
 
             # 6. Translate back if the user spoke a non-English language.
             if language_code != "en-IN":
@@ -255,7 +355,7 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
                 )
 
             # 7. Stream TTS audio back as binary frames.
-            async for chunk in streaming_audio_response(response, language_code=language_code):
+            async for chunk in streaming_audio_response(response, language_code=language_code, output_audio_bitrate="32k"):
                 if cancel_event.is_set():
                     logger.info("[WS] Stream cancelled — new utterance received.")
                     break

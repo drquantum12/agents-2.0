@@ -41,3 +41,13 @@ class AgentState(TypedDict):
     grade: Optional[str]         # e.g. "10" – used to calibrate explanation depth
     board: Optional[str]         # e.g. "CBSE" – curriculum context
     personalized: bool           # whether to personalise responses
+
+    # ── ReAct agent state ────────────────────────────────────────────────
+    # Set by quiz_user tool, cleared by check_answer tool.
+    # Persisted in the LangGraph checkpoint so the next turn knows a quiz
+    # answer is expected and can call check_answer with the stored value.
+    quiz_correct_answer: Optional[str]
+
+    # Running count of ReAct iterations across all turns in this session.
+    # Used for monitoring / debugging — not for routing decisions.
+    tool_call_count: int
