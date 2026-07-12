@@ -14,6 +14,7 @@ This collection is written to whenever lesson state changes and is the
 source of truth for SESSION RESTORE (first turn of a new session).
 """
 
+from datetime import datetime, timezone
 from typing import Optional, List
 from pymongo.collection import Collection
 from pymongo.database import Database
@@ -43,6 +44,9 @@ class TeacherMemoryManager:
             "lesson_status":    mem.get("lesson_status", "OFF"),
             "current_subtopic": mem.get("current_subtopic"),
             "step_context":     mem.get("step_context"),
+            "subtopic_idx":     mem.get("subtopic_idx", 0),
+            "weak_concepts":    mem.get("weak_concepts", []),
+            "session_count":    mem.get("session_count", 0),
         }
 
     # ── Write ─────────────────────────────────────────────────────────────
@@ -65,35 +69,53 @@ class TeacherMemoryManager:
         lesson_plan: List[str],
         first_subtopic: str,
     ) -> None:
-        """Atomic write when a new lesson begins."""
+        """Atomic write when a new lesson begins. Increments session_count."""
         self.upsert(user_id, {
             "topic":            topic,
             "lesson_plan":      lesson_plan,
             "lesson_status":    "ON",
             "current_subtopic": first_subtopic,
+            "subtopic_idx":     0,
             "step_context":     f"Starting lesson on '{topic}'. First subtopic: '{first_subtopic}'.",
+            "last_lesson_at":   datetime.now(tz=timezone.utc),
         })
+        # Increment session_count separately (avoid overwriting if already non-zero)
+        self.col.update_one(
+            {"user_id": user_id},
+            {"$inc": {"session_count": 1}},
+        )
 
     def advance_subtopic(
         self,
         user_id: str,
         completed: str,
         next_subtopic: Optional[str],
+        next_idx: int,
     ) -> None:
-        """Advance pointer after a subtopic is explained."""
+        """Advance pointer after a subtopic is explained and check-in passed."""
         self.upsert(user_id, {
             "current_subtopic": next_subtopic,
+            "subtopic_idx":     next_idx,
             "step_context":     (
                 f"Covered: '{completed}'. "
                 + (f"Next: '{next_subtopic}'." if next_subtopic else "Lesson complete.")
             ),
         })
 
+    def flag_weak_concept(self, user_id: str, concept: str) -> None:
+        """Append a concept the student struggled with to weak_concepts."""
+        self.col.update_one(
+            {"user_id": user_id},
+            {"$addToSet": {"weak_concepts": concept}},
+            upsert=True,
+        )
+
     def end_lesson(self, user_id: str) -> None:
-        """Mark lesson as finished but keep topic/plan for reference."""
+        """Mark lesson as finished but keep topic/plan and weak_concepts for reference."""
         self.upsert(user_id, {
             "lesson_status":    "OFF",
             "current_subtopic": None,
+            "subtopic_idx":     0,
             "step_context":     None,
         })
 

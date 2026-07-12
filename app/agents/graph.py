@@ -105,6 +105,11 @@ _web_memory:     Optional[WebSearchMemoryManager] = None
 _profile_memory: Optional[UserProfileMemory]      = None
 
 
+def get_teacher_memory() -> Optional[TeacherMemoryManager]:
+    """Return the module-level TeacherMemoryManager singleton (or None before init)."""
+    return _teacher_memory
+
+
 def init_agent(db_name: str = "neurosattva") -> None:
     """Call once at app startup to compile the graph and warm up memory managers."""
     global _graph, _teacher_memory, _web_memory, _profile_memory
@@ -174,7 +179,11 @@ def chat(
             "personalized":        personalized,
             "quiz_correct_answer": None,
             "tool_call_count":     0,
-            # Restore lesson fields from TeacherMemory
+            # Defaults for new lesson-tracking fields (overridden by lesson_state below)
+            "subtopic_idx":        0,
+            "weak_concepts":       [],
+            "session_count":       0,
+            # Restore lesson fields from TeacherMemory (may override defaults above)
             **lesson_state,
         }
     else:

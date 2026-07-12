@@ -36,6 +36,9 @@ class AgentState(TypedDict):
     lesson_status: Optional[str]       # ON | OFF
     current_subtopic: Optional[str]    # subtopic currently being taught
     step_context: Optional[str]        # free-text context for the current step
+    subtopic_idx: int                  # 0-based index into lesson_plan
+    weak_concepts: Optional[List[str]] # concepts the student struggled with
+    session_count: int                 # total study sessions this user has had
 
     # ── User profile (loaded once at session start) ───────────────────────
     grade: Optional[str]         # e.g. "10" – used to calibrate explanation depth

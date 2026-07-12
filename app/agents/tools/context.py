@@ -53,3 +53,17 @@ _user_context_var: ContextVar[Optional[dict]] = ContextVar(
 _memory_var: ContextVar[Optional[dict]] = ContextVar(
     "agent_memory_managers", default=None
 )
+
+# ── Active lesson state ───────────────────────────────────────────────────────
+# Shape: {
+#   "lesson_status":    "ON" | "OFF",
+#   "topic":            str | None,
+#   "lesson_plan":      list[str] | None,   # ordered subtopic strings
+#   "subtopic_idx":     int,                # 0-based current position
+#   "mode":             "STRICT" | "DEFAULT",
+# }
+# Populated from AgentState by react_agent_node so lesson tools can read
+# current position and plan without needing to query MongoDB mid-loop.
+_lesson_state_var: ContextVar[Optional[dict]] = ContextVar(
+    "agent_lesson_state", default=None
+)

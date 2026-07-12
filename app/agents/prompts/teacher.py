@@ -172,9 +172,9 @@ def build_lesson_restart_offer_prompt(topic: str, state: AgentState) -> str:
     gc = _grade_context(state)
 
     if subtopic:
-        context = f"you were last working on **{subtopic}**"
+        context = f"you were last working on {subtopic}"
     else:
-        context = f"you had started a lesson on **{topic}**"
+        context = f"you had started a lesson on {topic}"
 
     return f"""You are an AI tutor. {gc}
 

@@ -59,6 +59,53 @@ router = APIRouter(prefix="/devices", tags=["Device"])
 # Initialize controller
 device_config_controller = DeviceConfigController()
 
+
+def _release_other_active_devices(
+    user_id: str, keep_device_id: str, now: datetime,
+    reason: str = "superseded_by_new_device",
+) -> None:
+    """
+    Enforces one active device per user. Call this whenever a device is
+    claimed for `user_id` (brand-new claim or ownership transfer-in) so any
+    OTHER device still marked 'active' under this user gets released.
+
+    Without this, /devices/mine can return more than one 'active' device for
+    the same user and the app ends up showing a stale/"past" device instead
+    of (or alongside) the one just paired. The most common way a device goes
+    stale like this: the firmware's device-side unpair (fsm_unpair_device())
+    only clears the local NVS bearer token — it never calls this backend's
+    POST /devices/{device_id}/unpair — so the old device's ownership_status
+    stays "active" forever until something here cleans it up.
+    """
+    query = {
+        "owner_user_id": user_id,
+        "ownership_status": "active",
+        "_id": {"$ne": keep_device_id},
+    }
+
+    # Close open ownership_history entries first — this query needs
+    # owner_user_id intact, so it must run before ownership is released below.
+    mongo_db["devices"].update_many(
+        {**query, "ownership_history.released_at": None},
+        {"$set": {
+            "ownership_history.$.released_at": now,
+            "ownership_history.$.release_reason": reason,
+        }},
+    )
+
+    # Release ownership
+    mongo_db["devices"].update_many(
+        query,
+        {"$set": {
+            "owner_user_id": None,
+            "ownership_status": "unclaimed",
+            "is_online": False,
+            "pending_transfer": None,
+            "updated_at": now,
+        }},
+    )
+
+
 # ─── Rate Limiting ─────────────────────────────────────────────────────────────
 _device_call_times: dict[str, list[datetime]] = defaultdict(list)
 _rate_limit_lock = asyncio.Lock()
@@ -134,6 +181,7 @@ async def device_online(
             "created_at": now,
             "updated_at": now,
         })
+        _release_other_active_devices(new_user_id, device_id, now)
         _upsert_device_config(new_user_id, device_id, now)
         return {"status": "claimed", "device_id": device_id}
 
@@ -199,6 +247,7 @@ async def device_online(
         },
     )
 
+    _release_other_active_devices(new_user_id, device_id, now)
     _upsert_device_config(new_user_id, device_id, now)
 
     # Notify old owner — failure must never block the device registration response

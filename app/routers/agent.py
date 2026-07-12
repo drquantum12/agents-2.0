@@ -102,16 +102,32 @@ async def device_voice_assistant(request: Request,
     )
 
     language_code = result.language_code if result.language_code else ""
+    transcript = result.transcript or ""
 
-    # Unsupported / unrecognised language guard
-    if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
-        logger.warning(f"Unsupported or unrecognised language code: '{language_code}'")
+    # A known-but-unsupported language code is a genuine guard.
+    if language_code and language_code not in SUPPORTED_LANGUAGE_CODES:
+        logger.warning(f"Unsupported language code: '{language_code}'")
         return StreamingResponse(
             streaming_audio_response(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN"),
             media_type="audio/mpeg",
             headers=headers,
         )
-    
+
+    # Sarvam sometimes returns an empty language_code even though it produced
+    # a valid transcript (e.g. short/clear English utterances). Trust the
+    # transcript in that case instead of asking the user to repeat themselves.
+    if not language_code:
+        if transcript.strip():
+            logger.info("Empty language_code but transcript present — defaulting to en-IN")
+            language_code = "en-IN"
+        else:
+            logger.warning("Unrecognised language and no transcript produced")
+            return StreamingResponse(
+                streaming_audio_response(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN"),
+                media_type="audio/mpeg",
+                headers=headers,
+            )
+
     # print(f"Detected language code: {language_code}")
     # print(f"Transcript: {result.transcript}")
     # return StreamingResponse(
@@ -174,27 +190,63 @@ async def device_voice_assistant_test(request: Request):
         headers=headers
     )
 
+WS_TEST_SAMPLE_TEXT = (
+    "Robotic intelligence is the integration of Artificial Intelligence (AI) into physical robots, "
+    "enabling them to perceive, reason, learn, and act autonomously rather than just following "
+    "pre-programmed instructions. By combining AI \"brains\" with robotic \"bodies,\" these systems "
+    "process sensor data to navigate, solve problems, and interact with humans and environments."
+)
+
+
 @router.websocket("/device-voice-assistant-ws-test")
-async def device_voice_assistant_ws_test(websocket: WebSocket):
+async def device_voice_assistant_ws_test(
+    websocket: WebSocket,
+    output_audio_bitrate: str = "64k",
+    pace: float = 0.9,
+    language_code: str = "en-IN",
+    speech_sample_rate: int = 22050,
+    speaker: str = "anushka",
+    pitch: float = 0.0,
+    loudness: float = 1.0,
+    enable_preprocessing: bool = False,
+):
     """
-    WebSocket test endpoint — no auth, no STT/LLM/TTS calls.
+    WebSocket test endpoint — no auth, no STT/LLM calls, but runs the same
+    real Sarvam TTS pipeline as /test-audio-generator so a device can tune
+    audio quality from the client side.
+
+    Configure quality via query params on connect, e.g.:
+      ws://host/agent/device-voice-assistant-ws-test?output_audio_bitrate=32k&pace=0.9&speech_sample_rate=16000
 
     Protocol:
-      Device → Server : binary frame — raw audio bytes (ignored, just consumed)
-      Server → Device : binary frames — chunks of app/data/sample.mp3 streamed back
+      Device → Server : binary frame — raw audio bytes (ignored, just triggers a run)
+      Server → Device : binary frames — TTS-generated MP3 chunks of a fixed sample text
       Server → Device : text "DONE" — finished streaming the test audio
 
-    Lets a device test its WebSocket audio streaming pipeline against a
-    canned response without touching any real STT/LLM/TTS services.
+    Lets a device test its WebSocket audio streaming pipeline against real
+    TTS output at a chosen quality, without touching STT/LLM services.
     """
     await websocket.accept()
-    logger.info("[WS-TEST] Device connected")
+    logger.info(
+        "[WS-TEST] Device connected (bitrate=%s, pace=%s, language=%s, sample_rate=%s, speaker=%s, pitch=%s, loudness=%s, preprocessing=%s)",
+        output_audio_bitrate, pace, language_code, speech_sample_rate, speaker, pitch, loudness, enable_preprocessing,
+    )
 
     try:
         while True:
             await websocket.receive_bytes()
 
-            async for chunk in test_audio_stream():
+            async for chunk in streaming_audio_response(
+                WS_TEST_SAMPLE_TEXT,
+                language_code=language_code,
+                output_audio_bitrate=output_audio_bitrate,
+                pace=pace,
+                speech_sample_rate=speech_sample_rate,
+                speaker=speaker,
+                pitch=pitch,
+                loudness=loudness,
+                enable_preprocessing=enable_preprocessing
+            ):
                 await websocket.send_bytes(chunk)
 
             await websocket.send_text("DONE")
@@ -300,17 +352,19 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
             )
 
             language_code = result.language_code if result.language_code else ""
+            transcript = result.transcript or ""
 
             logger.info(
                 "[WS] STT → language: '%s' | transcript: '%s'",
                 language_code,
-                (result.transcript or "")[:120],
+                transcript[:120],
             )
 
-            if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
+            # A known-but-unsupported language code is a genuine guard.
+            if language_code and language_code not in SUPPORTED_LANGUAGE_CODES:
                 logger.warning(f"[WS] Unsupported language: '{language_code}'")
                 async for chunk in streaming_audio_response(
-                    UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN", output_audio_bitrate="32k"
+                    UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN", output_audio_bitrate="64k"
                 ):
                     if cancel_event.is_set():
                         break
@@ -318,6 +372,25 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
                 if not cancel_event.is_set():
                     await websocket.send_text("DONE")
                 continue
+
+            # Sarvam sometimes returns an empty language_code even though it
+            # produced a valid transcript. Trust the transcript instead of
+            # asking the user to repeat themselves.
+            if not language_code:
+                if transcript.strip():
+                    logger.info("[WS] Empty language_code but transcript present — defaulting to en-IN")
+                    language_code = "en-IN"
+                else:
+                    logger.warning("[WS] Unrecognised language and no transcript produced")
+                    async for chunk in streaming_audio_response(
+                        UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN", output_audio_bitrate="64k"
+                    ):
+                        if cancel_event.is_set():
+                            break
+                        await websocket.send_bytes(chunk)
+                    if not cancel_event.is_set():
+                        await websocket.send_text("DONE")
+                    continue
 
             # 4. Send immediate "thinking" signal so the device shows the
             #    neural-pulse animation with zero latency while STT just
@@ -355,7 +428,7 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
                 )
 
             # 7. Stream TTS audio back as binary frames.
-            async for chunk in streaming_audio_response(response, language_code=language_code, output_audio_bitrate="32k"):
+            async for chunk in streaming_audio_response(response, language_code=language_code, output_audio_bitrate="64k"):
                 if cancel_event.is_set():
                     logger.info("[WS] Stream cancelled — new utterance received.")
                     break
@@ -376,3 +449,5 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
         if cancel_event is not None:
             cancel_event.set()
         _active_cancel_events.pop(user_id, None)
+
+

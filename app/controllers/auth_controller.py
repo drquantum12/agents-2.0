@@ -45,6 +45,11 @@ class AuthController:
                 detail="Token is missing email claim"
             )
         photo_url = decoded_token.get("picture")
+        # Firebase issues a uid for every account type, not just Google —
+        # persist it here too so backend user_id -> Firebase UID is always
+        # resolvable (needed for Firestore security rules on the agent
+        # activity feed, which can only key off request.auth.uid).
+        firebase_uid = decoded_token.get("uid")
 
         # Check if user already exists
         if self.users_collection.find_one({"email": email}):
@@ -52,7 +57,7 @@ class AuthController:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
             )
-        
+
         user_id = str(uuid.uuid4())
         new_user = {
             "_id": user_id,
@@ -63,6 +68,7 @@ class AuthController:
             "board": user_data.board,
             "personalized_response": user_data.personalized_response,
             "account_type": "email",
+            "firebase_uid": firebase_uid,
             "created_at": datetime.now(timezone.utc)
         }
         
@@ -121,7 +127,21 @@ class AuthController:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="No account found for this email. Please register first."
             )
-        
+
+        # Self-healing backfill: accounts created before firebase_uid was
+        # persisted on every registration path won't have it stored. Every
+        # successful login already re-verifies a fresh Firebase ID token, so
+        # this is a free opportunity to fill the gap without a migration
+        # script — it naturally covers every existing user on their next login.
+        if not user.get("firebase_uid"):
+            firebase_uid = decoded_token.get("uid")
+            if firebase_uid:
+                self.users_collection.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"firebase_uid": firebase_uid}}
+                )
+                user["firebase_uid"] = firebase_uid
+
         # Generate access token
         token = create_access_token({"sub": user["_id"]})
         
@@ -172,13 +192,22 @@ class AuthController:
             
             if user:
                 # Login existing user - update photo_url if it changed
+                update_fields = {}
                 if photo_url and user.get("photo_url") != photo_url:
+                    update_fields["photo_url"] = photo_url
+                    user["photo_url"] = photo_url
+                # Same self-healing backfill as login_user() — defensive in
+                # case an existing Google-linked account somehow predates
+                # firebase_uid persistence.
+                if not user.get("firebase_uid") and firebase_uid:
+                    update_fields["firebase_uid"] = firebase_uid
+                    user["firebase_uid"] = firebase_uid
+                if update_fields:
                     self.users_collection.update_one(
                         {"_id": user["_id"]},
-                        {"$set": {"photo_url": photo_url}}
+                        {"$set": update_fields}
                     )
-                    user["photo_url"] = photo_url
-                
+
                 token = create_access_token({"sub": user["_id"]})
                 user_response = {
                     "id": user["_id"],

@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from langchain_core.tools import tool
 from app.db_utility.mongo_db import mongo_db
+from app.agents import nudge as _nudge
 from .context import _user_context_var, _state_patches_var
 
 logger = logging.getLogger(__name__)
@@ -44,13 +45,23 @@ def set_reminder(message: str, delay_minutes: int) -> str:
     try:
         now     = datetime.now(tz=timezone.utc)
         fire_at = now + timedelta(minutes=delay_minutes)
-        mongo_db["reminders"].insert_one({
+        result  = mongo_db["reminders"].insert_one({
             "user_id":    user_id,
             "message":    message,
             "fire_at":    fire_at,
             "delivered":  False,
             "created_at": now,
         })
+
+        # Schedule event-driven delivery — no polling needed
+        _nudge.schedule_nudge(
+            user_id    = user_id,
+            fire_at    = fire_at,
+            payload    = {"type": "nudge", "message": message},
+            collection = "reminders",
+            record_id  = result.inserted_id,
+        )
+
         hours, mins = divmod(delay_minutes, 60)
         time_str = (
             f"{hours} hour{'s' if hours != 1 else ''} and {mins} minute{'s' if mins != 1 else ''}"
@@ -86,16 +97,33 @@ def spaced_repeat(topic: str) -> str:
         now = datetime.now(tz=timezone.utc)
         records = [
             {
-                "user_id":    user_id,
-                "topic":      topic,
-                "review_at":  now + timedelta(days=d),
+                "user_id":       user_id,
+                "topic":         topic,
+                "review_at":     now + timedelta(days=d),
                 "interval_days": d,
-                "delivered":  False,
-                "created_at": now,
+                "delivered":     False,
+                "created_at":    now,
             }
             for d in (1, 3, 7)
         ]
-        mongo_db["spaced_reviews"].insert_many(records)
+        result = mongo_db["spaced_reviews"].insert_many(records)
+
+        # Schedule event-driven delivery for each review — no polling needed
+        for record, record_id in zip(records, result.inserted_ids):
+            days = record["interval_days"]
+            msg  = (
+                f"Time to review '{topic}'! "
+                f"It's been {days} day{'s' if days != 1 else ''} — "
+                f"a quick recap will lock it into long-term memory."
+            )
+            _nudge.schedule_nudge(
+                user_id    = user_id,
+                fire_at    = record["review_at"],
+                payload    = {"type": "nudge", "message": msg},
+                collection = "spaced_reviews",
+                record_id  = record_id,
+            )
+
         logger.info("spaced_repeat: 3 reviews scheduled for '%s' for %s", topic, user_id)
         return (
             f"Great! I've scheduled review sessions for '{topic}' "

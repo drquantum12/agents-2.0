@@ -8,6 +8,7 @@ from sarvamai import SarvamAI, AsyncSarvamAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Assuming these are defined elsewhere
 from app.agents import init_agent
+from app.agents import nudge as nudge_service
 from app.state import state
 from app.utility.hiveMQ import HiveMQClient
 # from db_utility.vector_db import VectorDB 
@@ -35,6 +36,12 @@ async def lifespan(app: FastAPI):
     state.sarvam_client = SarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
     state.mqtt_client = HiveMQClient()
     init_agent(db_name="neurosattva")
+
+    # Nudge system: capture the running event loop then reschedule any
+    # nudges that were in-flight before the last server restart.
+    nudge_service.set_event_loop(asyncio.get_event_loop())
+    await nudge_service.recover_pending_nudges()
+
     try:
         await state.mqtt_client.connect()
     except Exception as e:

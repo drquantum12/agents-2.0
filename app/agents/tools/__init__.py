@@ -14,6 +14,7 @@ from .math_tool     import calculate
 from .quiz_tools    import quiz_user, check_answer
 from .profile_tools import get_user_profile, update_user_profile
 from .memory_tools  import set_reminder, spaced_repeat, clarify_intent
+from .lesson_tools  import start_lesson, advance_subtopic, end_lesson, flag_weak_concept
 
 ALL_TOOLS = [
     signal_device_state,
@@ -27,6 +28,11 @@ ALL_TOOLS = [
     set_reminder,
     spaced_repeat,
     clarify_intent,
+    # ── Lesson / study-session tools ──
+    start_lesson,
+    advance_subtopic,
+    end_lesson,
+    flag_weak_concept,
 ]
 
 __all__ = [
@@ -42,4 +48,8 @@ __all__ = [
     "set_reminder",
     "spaced_repeat",
     "clarify_intent",
+    "start_lesson",
+    "advance_subtopic",
+    "end_lesson",
+    "flag_weak_concept",
 ]

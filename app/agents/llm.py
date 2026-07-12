@@ -15,10 +15,15 @@ class LLM:
 
         self.main_llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
-            temperature=0.7,
+            temperature=0.3,  # lower = more deterministic tool-calling; 0.7 caused random skips
             max_output_tokens=4096,
             timeout=60,
             max_retries=2,
+            # Disable the thinking budget: gemini-2.5-flash is a thinking model and sometimes
+            # generates only an internal thinking block with empty final content + no tool_calls.
+            # Setting thinking_budget=0 forces it to behave like a standard non-thinking model,
+            # making tool-calling reliable.
+            thinking_budget=0,
         )
         # self.llm = ChatOllama(base_url="http://localhost:11434",
         #           model="llama3.2:latest",
