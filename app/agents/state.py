@@ -1,0 +1,56 @@
+"""
+state.py
+─────────────────────────────────────────────
+Single source of truth for the LangGraph agent state.
+
+Notes:
+  • `messages` uses Annotated[list, operator.add] so LangGraph APPENDS
+    new messages on each node return instead of replacing the whole list.
+  • All lesson / teacher fields are Optional so they start as None and are
+    only populated once a lesson is active.
+  • `user_id` is included so every node can address MongoDB without needing
+    a separate argument.
+"""
+
+import operator
+from typing import Annotated, List, Optional
+from typing_extensions import TypedDict
+from langchain_core.messages import BaseMessage
+
+
+class AgentState(TypedDict):
+    # ── Core ─────────────────────────────────────────────────────────────
+    query: str                                   # current user input
+    messages: Annotated[List[BaseMessage], operator.add]  # full conversation
+    session_id: str                              # LangGraph thread_id
+    user_id: str                                 # MongoDB user._id
+
+    # ── Routing ──────────────────────────────────────────────────────────
+    intent: Optional[str]        # EXPLANATION | GENERAL | WEB_SEARCH | CONFIRM_WITH_USER
+    awaiting_user_input: bool    # True  → next turn must hit user_confirmation node
+
+    # ── Lesson / teacher state (mirrored from TeacherMemory) ─────────────
+    mode: str                    # STRICT | DEFAULT  (controls teacher behaviour)
+    topic: Optional[str]         # e.g. "Neural Networks"
+    lesson_plan: Optional[List[str]]   # ordered list of subtopic strings
+    lesson_status: Optional[str]       # ON | OFF
+    current_subtopic: Optional[str]    # subtopic currently being taught
+    step_context: Optional[str]        # free-text context for the current step
+    subtopic_idx: int                  # 0-based index into lesson_plan
+    weak_concepts: Optional[List[str]] # concepts the student struggled with
+    session_count: int                 # total study sessions this user has had
+
+    # ── User profile (loaded once at session start) ───────────────────────
+    grade: Optional[str]         # e.g. "10" – used to calibrate explanation depth
+    board: Optional[str]         # e.g. "CBSE" – curriculum context
+    personalized: bool           # whether to personalise responses
+
+    # ── ReAct agent state ────────────────────────────────────────────────
+    # Set by quiz_user tool, cleared by check_answer tool.
+    # Persisted in the LangGraph checkpoint so the next turn knows a quiz
+    # answer is expected and can call check_answer with the stored value.
+    quiz_correct_answer: Optional[str]
+
+    # Running count of ReAct iterations across all turns in this session.
+    # Used for monitoring / debugging — not for routing decisions.
+    tool_call_count: int

@@ -28,6 +28,7 @@ class UserUpdate(BaseModel):
     board: Optional[str] = Field(None, max_length=50)
     personalized_response: Optional[bool] = None
     photo_url: Optional[str] = None
+    notify_on_new_device: Optional[bool] = None
 
 
 class User(UserBase):

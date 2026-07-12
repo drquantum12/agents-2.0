@@ -2,15 +2,15 @@ import asyncio
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from app.agents.core_agent import run_agent
+from app.agents import chat
 from app.utility.security import get_current_user, decode_access_token
 from app.models.user import User
 import tempfile
 from app.agents.utility import translate_text, streaming_audio_response, test_audio_stream, test_audio_stream_with_jitter
-from app.agents.agent_memory_controller import get_or_create_device_session_id
-from app.db_utility.mongo_db import mongo_db
+from app.db_utility.mongo_db import mongo_db, get_or_create_device_session_id
+from app.utility.security import ENABLE_AUTH, _DEV_STUB_USER
 import os, io
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Callable, Optional
 import logging
 from app.state import state
 
@@ -66,8 +66,8 @@ class QueryRequest(BaseModel):
 async def agent(request: QueryRequest, 
                 user: User = Depends(get_current_user)
                 ):
-    session_id = get_or_create_device_session_id(user_id=user["_id"])
-    response = await asyncio.to_thread(run_agent, user=user, query=request.query, session_id=session_id)
+    session_id, is_new_session = get_or_create_device_session_id(user_id=user["_id"])
+    response = await asyncio.to_thread(chat, user_id=str(user["_id"]), session_id=session_id, query=request.query, is_new_session=is_new_session)
     return {"response": response}
         
 @router.post("/device-voice-assistant")
@@ -83,8 +83,8 @@ async def device_voice_assistant(request: Request,
     # 1. Receive user audio 
     wav_data = await request.body()
 
-    with open("app/data/input_32bit.wav", "wb") as f:
-            f.write(wav_data)
+    # with open("app/data/input_32bit.wav", "wb") as f:
+    #         f.write(wav_data)
 
     # return
     # return StreamingResponse(
@@ -102,16 +102,32 @@ async def device_voice_assistant(request: Request,
     )
 
     language_code = result.language_code if result.language_code else ""
+    transcript = result.transcript or ""
 
-    # Unsupported / unrecognised language guard
-    if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
-        logger.warning(f"Unsupported or unrecognised language code: '{language_code}'")
+    # A known-but-unsupported language code is a genuine guard.
+    if language_code and language_code not in SUPPORTED_LANGUAGE_CODES:
+        logger.warning(f"Unsupported language code: '{language_code}'")
         return StreamingResponse(
             streaming_audio_response(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN"),
             media_type="audio/mpeg",
             headers=headers,
         )
-    
+
+    # Sarvam sometimes returns an empty language_code even though it produced
+    # a valid transcript (e.g. short/clear English utterances). Trust the
+    # transcript in that case instead of asking the user to repeat themselves.
+    if not language_code:
+        if transcript.strip():
+            logger.info("Empty language_code but transcript present — defaulting to en-IN")
+            language_code = "en-IN"
+        else:
+            logger.warning("Unrecognised language and no transcript produced")
+            return StreamingResponse(
+                streaming_audio_response(UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN"),
+                media_type="audio/mpeg",
+                headers=headers,
+            )
+
     # print(f"Detected language code: {language_code}")
     # print(f"Transcript: {result.transcript}")
     # return StreamingResponse(
@@ -131,8 +147,15 @@ async def device_voice_assistant(request: Request,
     # --------------------------
 
     # 3. Get LLM response
-    session_id = get_or_create_device_session_id(user_id=user["_id"])
-    response = await asyncio.to_thread(run_agent, user=user, query=result.transcript, session_id=session_id)
+    session_id, is_new_session = get_or_create_device_session_id(user_id=user["_id"])
+    response = await asyncio.to_thread(chat, user_id=str(user["_id"]),
+                                    session_id=session_id, 
+                                    query=result.transcript,
+                                    is_new_session=is_new_session,
+                                    grade=user.get("grade"),
+                                    board=user.get("board"),
+                                    personalized=user.get("personalized", False)
+                                    )
 
     # 4. Translate back to detected language
     if language_code != "en-IN":
@@ -143,7 +166,7 @@ async def device_voice_assistant(request: Request,
         )
 
     return StreamingResponse(
-        _cancellable_stream(streaming_audio_response(response, language_code=language_code), cancel_event),
+        _cancellable_stream(streaming_audio_response(response, language_code=language_code, output_audio_bitrate="8k"), cancel_event),
         media_type="audio/mpeg",
         headers=headers,
     )
@@ -156,16 +179,87 @@ async def device_voice_assistant_test(request: Request):
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no"
     }
-    wav_data = await request.body()
+    # wav_data = await request.body()
 
-    with open("app/data/input_32bit.wav", "wb") as f:
-            f.write(wav_data)
+    # with open("app/data/input_32bit_test.wav", "wb") as f:
+    #         f.write(wav_data)
             
     return StreamingResponse(
-        test_audio_stream_with_jitter(),
+        test_audio_stream(),
         media_type="audio/mpeg",
         headers=headers
     )
+
+WS_TEST_SAMPLE_TEXT = (
+    "Robotic intelligence is the integration of Artificial Intelligence (AI) into physical robots, "
+    "enabling them to perceive, reason, learn, and act autonomously rather than just following "
+    "pre-programmed instructions. By combining AI \"brains\" with robotic \"bodies,\" these systems "
+    "process sensor data to navigate, solve problems, and interact with humans and environments."
+)
+
+
+@router.websocket("/device-voice-assistant-ws-test")
+async def device_voice_assistant_ws_test(
+    websocket: WebSocket,
+    output_audio_bitrate: str = "64k",
+    pace: float = 0.9,
+    language_code: str = "en-IN",
+    speech_sample_rate: int = 22050,
+    speaker: str = "anushka",
+    pitch: float = 0.0,
+    loudness: float = 1.0,
+    enable_preprocessing: bool = False,
+):
+    """
+    WebSocket test endpoint — no auth, no STT/LLM calls, but runs the same
+    real Sarvam TTS pipeline as /test-audio-generator so a device can tune
+    audio quality from the client side.
+
+    Configure quality via query params on connect, e.g.:
+      ws://host/agent/device-voice-assistant-ws-test?output_audio_bitrate=32k&pace=0.9&speech_sample_rate=16000
+
+    Protocol:
+      Device → Server : binary frame — raw audio bytes (ignored, just triggers a run)
+      Server → Device : binary frames — TTS-generated MP3 chunks of a fixed sample text
+      Server → Device : text "DONE" — finished streaming the test audio
+
+    Lets a device test its WebSocket audio streaming pipeline against real
+    TTS output at a chosen quality, without touching STT/LLM services.
+    """
+    await websocket.accept()
+    logger.info(
+        "[WS-TEST] Device connected (bitrate=%s, pace=%s, language=%s, sample_rate=%s, speaker=%s, pitch=%s, loudness=%s, preprocessing=%s)",
+        output_audio_bitrate, pace, language_code, speech_sample_rate, speaker, pitch, loudness, enable_preprocessing,
+    )
+
+    try:
+        while True:
+            await websocket.receive_bytes()
+
+            async for chunk in streaming_audio_response(
+                WS_TEST_SAMPLE_TEXT,
+                language_code=language_code,
+                output_audio_bitrate=output_audio_bitrate,
+                pace=pace,
+                speech_sample_rate=speech_sample_rate,
+                speaker=speaker,
+                pitch=pitch,
+                loudness=loudness,
+                enable_preprocessing=enable_preprocessing
+            ):
+                await websocket.send_bytes(chunk)
+
+            await websocket.send_text("DONE")
+
+    except WebSocketDisconnect:
+        logger.info("[WS-TEST] Device disconnected")
+    except Exception as e:
+        logger.error(f"[WS-TEST] Unexpected error: {e}")
+        try:
+            await websocket.send_text(f"ERROR:{e}")
+        except Exception:
+            pass
+
 
 @router.websocket("/device-voice-assistant-ws")
 async def device_voice_assistant_ws(websocket: WebSocket, token: str):
@@ -183,23 +277,47 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
     """
     # 1. Authenticate via query-param token (WebSocket upgrade cannot send
     #    an Authorization header from most embedded/IoT clients).
-    payload = decode_access_token(token)
-    if payload is None:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
+    #    When ENABLE_AUTH=false (local dev), skip validation and use the
+    #    same stub user that HTTP endpoints receive via get_current_user.
+    if not ENABLE_AUTH:
+        user = _DEV_STUB_USER
+        user_id: str = user["_id"]
+    else:
+        payload = decode_access_token(token)
+        if payload is None:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
 
-    user_id: str = payload.get("sub", "")
-    if not user_id:
-        await websocket.close(code=4001, reason="Invalid token")
-        return
+        user_id = payload.get("sub", "")
+        if not user_id:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
 
-    user = await asyncio.to_thread(mongo_db["users"].find_one, {"_id": user_id})
-    if not user:
-        await websocket.close(code=4001, reason="User not found")
-        return
+        user = await asyncio.to_thread(mongo_db["users"].find_one, {"_id": user_id})
+        if not user:
+            await websocket.close(code=4001, reason="User not found")
+            return
 
     await websocket.accept()
     logger.info(f"[WS] Device connected: {user_id}")
+
+    # Build a thread-safe signal callback.
+    # The ReAct agent tools (signal_device_state, search_web, rag_tool) call
+    # this from within the sync thread started by asyncio.to_thread().
+    # asyncio.run_coroutine_threadsafe posts the send coroutine onto the event
+    # loop and blocks the worker thread briefly until the send completes.
+    _loop = asyncio.get_event_loop()
+
+    def _make_signal_fn(ws: WebSocket, loop: asyncio.AbstractEventLoop) -> Callable[[str], None]:
+        def signal_fn(json_msg: str) -> None:
+            fut = asyncio.run_coroutine_threadsafe(ws.send_text(json_msg), loop)
+            try:
+                fut.result(timeout=5.0)
+            except Exception as sig_exc:
+                logger.warning("[WS] signal_fn send failed: %s", sig_exc)
+        return signal_fn
+
+    signal_fn = _make_signal_fn(websocket, _loop)
 
     cancel_event: asyncio.Event | None = None
 
@@ -214,7 +332,18 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
             cancel_event = asyncio.Event()
             _active_cancel_events[user_id] = cancel_event
 
-            # 4. Speech-to-text + language detection.
+            # 4. (Test mode) Skip STT/LLM entirely — stream pre-baked MP3 test audio.
+            # if not ENABLE_AUTH:
+            #     logger.info("[WS] Test mode: skipping STT/LLM, streaming test audio")
+            #     async for chunk in test_audio_stream():
+            #         if cancel_event.is_set():
+            #             break
+            #         await websocket.send_bytes(chunk)
+            #     if not cancel_event.is_set():
+            #         await websocket.send_text("DONE")
+            #     continue
+
+            # 3. Speech-to-text + language detection.
             result = await asyncio.to_thread(
                 lambda: state.sarvam_client.speech_to_text.translate(
                     file=wav_data,
@@ -223,11 +352,19 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
             )
 
             language_code = result.language_code if result.language_code else ""
+            transcript = result.transcript or ""
 
-            if not language_code or language_code not in SUPPORTED_LANGUAGE_CODES:
+            logger.info(
+                "[WS] STT → language: '%s' | transcript: '%s'",
+                language_code,
+                transcript[:120],
+            )
+
+            # A known-but-unsupported language code is a genuine guard.
+            if language_code and language_code not in SUPPORTED_LANGUAGE_CODES:
                 logger.warning(f"[WS] Unsupported language: '{language_code}'")
                 async for chunk in streaming_audio_response(
-                    UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN"
+                    UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN", output_audio_bitrate="64k"
                 ):
                     if cancel_event.is_set():
                         break
@@ -236,11 +373,53 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
                     await websocket.send_text("DONE")
                 continue
 
-            # 5. LLM agent response.
-            session_id = get_or_create_device_session_id(user_id=user["_id"])
+            # Sarvam sometimes returns an empty language_code even though it
+            # produced a valid transcript. Trust the transcript instead of
+            # asking the user to repeat themselves.
+            if not language_code:
+                if transcript.strip():
+                    logger.info("[WS] Empty language_code but transcript present — defaulting to en-IN")
+                    language_code = "en-IN"
+                else:
+                    logger.warning("[WS] Unrecognised language and no transcript produced")
+                    async for chunk in streaming_audio_response(
+                        UNSUPPORTED_LANGUAGE_MESSAGE, language_code="en-IN", output_audio_bitrate="64k"
+                    ):
+                        if cancel_event.is_set():
+                            break
+                        await websocket.send_bytes(chunk)
+                    if not cancel_event.is_set():
+                        await websocket.send_text("DONE")
+                    continue
+
+            # 4. Send immediate "thinking" signal so the device shows the
+            #    neural-pulse animation with zero latency while STT just
+            #    finished. The ReAct agent will then emit "searching" or
+            #    "asking" signals autonomously via signal_device_state tool.
+            await websocket.send_text('{"type":"agent_state","value":"thinking"}')
+
+            # 5. LLM ReAct agent response.
+            #    signal_fn is passed in so agent tools can push WS frames from
+            #    inside the sync thread (e.g. "searching" before a Milvus call).
+            session_id, is_new_session = get_or_create_device_session_id(user_id=user["_id"])
             response = await asyncio.to_thread(
-                run_agent, user=user, query=result.transcript, session_id=session_id
+                chat,
+                user_id=str(user["_id"]),
+                session_id=session_id,
+                query=result.transcript,
+                is_new_session=is_new_session,
+                grade=user.get("grade"),
+                board=user.get("board"),
+                personalized=user.get("personalized", False),
+                signal_fn=signal_fn,
             )
+
+            # logger.info(
+            #     "[WS] STT transcript: '%s' | Agent response (%d chars): '%s'",
+            #     (result.transcript or "")[:80],
+            #     len(response),
+            #     response[:120],
+            # )
 
             # 6. Translate back if the user spoke a non-English language.
             if language_code != "en-IN":
@@ -249,7 +428,7 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
                 )
 
             # 7. Stream TTS audio back as binary frames.
-            async for chunk in streaming_audio_response(response, language_code=language_code):
+            async for chunk in streaming_audio_response(response, language_code=language_code, output_audio_bitrate="64k"):
                 if cancel_event.is_set():
                     logger.info("[WS] Stream cancelled — new utterance received.")
                     break
@@ -270,3 +449,5 @@ async def device_voice_assistant_ws(websocket: WebSocket, token: str):
         if cancel_event is not None:
             cancel_event.set()
         _active_cancel_events.pop(user_id, None)
+
+

@@ -10,6 +10,7 @@ MILVUS_URI = os.getenv('MILVUS_URI')
 MILVUS_TOKEN = os.getenv('MILVUS_TOKEN')
 COLLECTION_NAME = os.getenv('MILVUS_COLLECTION_NAME')
 VECTOR_DIMENSION = int(os.getenv('MILVUS_VECTOR_DIMENSION', 768))
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'production')
 
 # metadata_fields = ["board", "grade", "subject", "chapter", "heading", "subheading", "content"]
 
@@ -17,7 +18,7 @@ class VectorDB:
     
     def __init__(self):
         self.client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
-        self.similarity_score_threshold = 0.6  # Example threshold for similarity score
+        self.similarity_score_threshold = 0.0  # Example threshold for similarity score
 
     def get_similar_documents(self, text, top_k=3, board=None, grade=None, subject=None, chapter=None):
         """
@@ -28,14 +29,14 @@ class VectorDB:
             # Build filter expression if any filter is provided
             filter_clauses = []
             if board:
-                filter_clauses.append(f"metadata_json['board'] == '{board}'")
+                filter_clauses.append(f"board == '{board}'")
             if grade:
-                filter_clauses.append(f"metadata_json['grade'] == '{grade}'")
+                filter_clauses.append(f"class_num == {grade}")
             if subject:
-                filter_clauses.append(f"metadata_json['subject'] == '{subject}'")
+                filter_clauses.append(f"subject == '{subject}'")
             if chapter:
-                filter_clauses.append(f"metadata_json['chapter'] == '{chapter}'")
-            filter_expression = " and ".join(filter_clauses) if filter_clauses else None
+                filter_clauses.append(f"chapter == '{chapter}'")
+            filter_expression = " AND ".join(filter_clauses) if filter_clauses else None
 
             search_kwargs = {
                 "collection_name": COLLECTION_NAME,
@@ -45,7 +46,7 @@ class VectorDB:
                     "metric_type": "COSINE"
                 },
                 "limit": top_k,
-                "output_fields": ["metadata_json"]
+                "output_fields": ["board", "class_num", "subject", "chapter", "concept", "explanation", "analogies"]
             }
             if filter_expression:
                 search_kwargs["filter"] = filter_expression
@@ -56,10 +57,10 @@ class VectorDB:
                     "source": []
                 }
             for result in results[0]:
-                metadata = result["entity"].get("metadata_json", {})
+                metadata = result["entity"]
                 if metadata and result["distance"] >= self.similarity_score_threshold:
-                    context_for_llm["content"].append(metadata.get("content", ""))
-                    context_for_llm["source"].append(f"{metadata.get('board')} - {metadata.get('grade')} - {metadata.get('subject')} - {metadata.get('chapter')} - {metadata.get('subheading')}")
+                    context_for_llm["content"].append("Explanation: " +metadata.get("explanation", "") + "\nAnalogies: " + metadata.get("analogies", ""))
+                    context_for_llm["source"].append(f"{metadata.get('board')} - {metadata.get('class_num')} - {metadata.get('subject')} - {metadata.get('chapter')} - {metadata.get('concept')}")
             return "\n".join(context_for_llm["content"]), context_for_llm["source"]
         except Exception as e:
             raise Exception(f"Error retrieving similar documents: {str(e)}")
@@ -72,18 +73,18 @@ class VectorDB:
         try:
             filter_clauses = []
             if board:
-                filter_clauses.append(f"metadata_json['board'] == '{board}'")
+                filter_clauses.append(f"board == '{board}'")
             if grade:
-                filter_clauses.append(f"metadata_json['grade'] == '{grade}'")
+                filter_clauses.append(f"class_num == {grade}")
             if subject:
-                filter_clauses.append(f"metadata_json['subject'] == '{subject}'")
+                filter_clauses.append(f"subject == '{subject}'")
             if chapter:
-                filter_clauses.append(f"metadata_json['chapter'] == '{chapter}'")
-            filter_expression = " and ".join(filter_clauses) if filter_clauses else None
+                filter_clauses.append(f"chapter == '{chapter}'")
+            filter_expression = " AND ".join(filter_clauses) if filter_clauses else None
 
             search_kwargs = {
                 "collection_name": COLLECTION_NAME,
-                "output_fields": ["metadata_json"],
+                "output_fields": ["board", "class_num", "subject", "chapter", "concept", "explanation", "analogies"],
                 "limit": limit
             }
             if filter_expression:
@@ -92,7 +93,7 @@ class VectorDB:
             results = self.client.query(**search_kwargs)
             documents = []
             for result in results:
-                metadata = result.get("metadata_json", {})
+                metadata = result["entity"]
                 if metadata:
                     documents.append(metadata)
             return documents
@@ -119,3 +120,27 @@ def generate_embedding(text, vector_dimension=768):
     except Exception as e:
         print(f"Error generating embedding: {e}")
         return None
+    
+
+if __name__ == "__main__":
+    # Example usage
+    vdb = VectorDB()
+    text_query = "What are the key features of photosynthesis?"
+
+    # res = vdb.client.search(
+    #     collection_name=COLLECTION_NAME,
+    #     anns_field="embedding",
+    #     data=[[0.1] * VECTOR_DIMENSION],
+    #     search_params={"metric_type": "COSINE"},
+    #     limit=3,
+    #     filter="board == 'CBSE' AND class_num == 10",
+    #     output_fields=["board", "class_num", "subject", "chapter", "concept", "explanation", "analogies"]
+    # )
+
+    context, sources = vdb.get_similar_documents(text_query, top_k=3, board="CBSE", subject="Science", grade=9)
+
+    print("Context for LLM:")
+    print(context)
+    print("Sources:")
+    print(sources)
+    # print(f"Raw Milvus search results: {res[0][0]}")
